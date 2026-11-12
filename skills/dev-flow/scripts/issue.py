@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 # issue.py - Issue domain operations for dev-flow
 #
-# Merged from domain/issue/ (title.py, body.py, link.py, sync.py)
-#
 # Provides:
-#   Title: extract_scope, extract_type, validate_issue_title, build_title
+#   Title: extract_scope, extract_type, validate_issue_title
 #   Body: build_structured_issue_body
-#   Link: build_repo_blob_url
+#   Sync pipeline: extract_plan_section, extract_acceptance_criteria,
+#                  build_synced_issue_body, replace_plan_row_in_body
 #   Sync: sync_status_label, sync_plan_to_issue_body, ensure_issue_labels,
 #         sync_status_label_group, sync_type_label_group, sync_project_label_group,
 #         ensure_label_exists, plan_status_to_issue_label
@@ -17,14 +16,13 @@ import json
 from pathlib import Path
 
 from lib.github import get_issue_labels
-from labels import plan_type_to_issue_label
+from lib.logging import log_warn
+from labels import plan_type_to_issue_label, normalize_plan_type
 
-# Lazy imports for plan module to avoid circular dependency
-# plan.py imports build_repo_blob_url from this module
 def _get_plan_functions():
     """Lazy import plan module functions to break circular import."""
     import plan as _plan
-    return _plan.get_plan_project, _plan.get_plan_type, _plan.build_issue_body_from_plan
+    return _plan.get_plan_project, _plan.get_plan_type, _plan.build_plan_link_for_issue
 
 
 # ============================================
@@ -36,8 +34,8 @@ class ValidationError(Exception):
     pass
 
 
-# Valid types for Issue title
-VALID_TYPES = ['feat', 'fix', 'perf', 'refactor', 'docs', 'test', 'chore', 'enhance']
+# Valid types for Issue title (canonical values, aligned with labels.py)
+VALID_TYPES = ['feature', 'enhance', 'fix', 'perf', 'refactor', 'docs', 'test', 'chore']
 
 
 def extract_scope(title: str) -> str:
@@ -74,70 +72,63 @@ def extract_type(title: str) -> str:
     return ""
 
 
+_DESCRIPTION_MAX = 70
+_TITLE_MAX = 100
+
+
 def validate_issue_title(title: str) -> None:
     """Validate Issue title format and length.
-    
-    Format: <type>(<scope>): <description>
-    
-    Constraints:
-        - type must be valid (feat/fix/perf/refactor/docs/test/chore/enhance)
-        - scope is MANDATORY (must be present in parentheses)
-        - description <= 50 chars
-        - total title <= 72 chars
-        
+
+    Issue title is free-form. A loose type prefix is optional and used for
+    label inference. Scope is not mandatory.
+
+    Two limits, and they measure different strings:
+        - the *description* — everything after an optional `type:` /
+          `type(scope):` prefix — is capped at 70 chars
+        - the *whole title*, prefix included, is capped at 100 chars
+
+    The description cap is the one that carries meaning; the total cap only
+    stops a prefix from smuggling length past it.
+
     Args:
         title: Issue title string
-        
+
     Raises:
         ValidationError: If title is invalid
     """
-    # Check format: type(scope): description (scope is now mandatory)
-    if not re.match(r'^[a-z]+\([^)]+\):\s*.+$', title):
-        raise ValidationError(
-            "Invalid title format. Expected: <type>(<scope>): <description>\n"
-            "Scope is mandatory - must be enclosed in parentheses\n"
-            f"Example: feat(cli): add skills remove command\n"
-            f"Your title: {title}"
-        )
-    
-    # Extract type
+    # Extract type prefix (optional). If present, validate it.
     type_val = extract_type(title)
-    
-    # Validate type
-    if type_val not in VALID_TYPES:
-        raise ValidationError(
-            f"Invalid type: {type_val}\n"
-            f"Valid types: feat, fix, perf, refactor, docs, test, chore, enhance"
-        )
-    
-    # Extract scope
-    scope = extract_scope(title)
-    
-    # Scope is now mandatory
-    if not scope:
-        raise ValidationError(
-            "Scope is mandatory but not found in title\n"
-            "Expected format: <type>(<scope>): <description>"
-        )
-    
-    # Extract description (after type(scope): ), strip whitespace like Bash sed
-    match = re.match(r'^[a-z]+\([^)]+\):\s*(.*)$', title)
+    if type_val:
+        try:
+            normalize_plan_type(type_val)
+        except Exception:
+            raise ValidationError(
+                f"Invalid type: {type_val}\n"
+                f"Valid types: feature, enhance, fix, perf, refactor, docs, test, chore"
+            )
+
+    # Extract description: strip optional type(scope): or type: prefix
+    match = re.match(r'^[a-z]+(\([^)]+\))?:\s*(.*)$', title)
     if match:
-        description = match.group(1).strip()
+        description = match.group(2).strip()
     else:
-        description = ""
-    
+        description = title.strip()
+
     # Check description is not empty
     if not description:
         raise ValidationError("Description cannot be empty")
-    
-    # Check description length (<= 50 chars)
-    if len(description) > 50:
+
+    # Check description length. This measures the text AFTER the type prefix,
+    # not the whole title — the prefix is fixed vocabulary and does not count.
+    if len(description) > _DESCRIPTION_MAX:
         raise ValidationError(
-            f"Description too long: {len(description)} chars (max 50)\n"
+            f"Description too long: {len(description)} chars "
+            f"(max {_DESCRIPTION_MAX}).\n"
+            f"Measured after the type prefix, so the limit applies to "
+            f"'{description}' alone.\n"
             f"Description: {description}"
         )
-    
+
     # Check description is ASCII (English only)
     if not description.isascii():
         raise ValidationError(
@@ -145,32 +136,12 @@ def validate_issue_title(title: str) -> None:
             f"Per AGENTS.md Issue title convention: description should be English imperative sentence\n"
             f"Your description: {description}"
         )
-    
-    # Check total title length (<= 72 chars)
-    if len(title) > 72:
+
+    # Check total title length
+    if len(title) > _TITLE_MAX:
         raise ValidationError(
-            f"Title too long: {len(title)} chars (max 72)"
+            f"Title too long: {len(title)} chars (max {_TITLE_MAX})"
         )
-
-
-def build_title(type_: str, scope: str, description: str) -> str:
-    """Build Issue title from components.
-
-    Args:
-        type_: Issue type (e.g., "feat", "fix")
-        scope: Scope string (e.g., "cli")
-        description: Description string
-
-    Returns:
-        Formatted Issue title string
-    """
-    return f"{type_}({scope}): {description}"
-
-
-# ============================================
-# Body (from body.py)
-# ============================================
-
 def _render_section(heading: str, content: str, fallback: str = None) -> str:
     """Render a single issue section with consistent formatting."""
     if content:
@@ -265,30 +236,41 @@ def build_structured_issue_body(**kwargs) -> str:
     return body
 
 
-# ============================================
-# Link (from link.py)
-# ============================================
-
-def build_repo_blob_url(repo: str, repo_path: str, branch: str = "main") -> str:
-    """Build GitHub blob URL for a repository path.
-    
-    Args:
-        repo: Repository in owner/repo format (e.g., "sampx/wopal-space")
-        repo_path: Path within the repository
-        branch: Branch name (default: "main")
-        
-    Returns:
-        Full GitHub blob URL
-    """
-    return f"https://github.com/{repo}/blob/{branch}/{repo_path}"
-
-
-# ============================================
-# Sync (from sync.py)
-# ============================================
-
 # Status label group (4-state model)
 STATUS_LABELS = ["status/planning", "status/in-progress", "status/verifying", "status/done"]
+
+# Presentation for the labels the lifecycle must be able to set. A repo can be
+# missing them (fresh repo, renamed label); sync_status_label creates them on
+# demand instead of failing the whole edit silently.
+STATUS_LABEL_META = {
+    "status/planning": ("规划中，方案待定", "FBCA04"),
+    "status/in-progress": ("开发中", "0E8A16"),
+    "status/verifying": ("Awaiting user verification", "5319e7"),
+    "status/done": ("已完成关闭", "1D76DB"),
+}
+
+
+def ensure_status_label(repo: str, label: str) -> bool:
+    """Create or refresh one status label so the edit cannot fail on it.
+
+    Returns True when the repository has the label afterwards.
+    """
+    description, color = STATUS_LABEL_META.get(label, (label, "EDEDED"))
+    try:
+        result = subprocess.run(
+            [
+                'gh', 'label', 'create', label,
+                '--repo', repo,
+                '--color', color,
+                '--description', description,
+                '--force',
+            ],
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
 
 
 def plan_status_to_issue_label(status: str) -> str:
@@ -336,45 +318,214 @@ def sync_status_label(issue_number: int, status: str, repo: str) -> None:
         args.extend(['--remove-label', label])
     for label in labels_to_add:
         args.extend(['--add-label', label])
-    
-    subprocess.run(args, capture_output=True)
+
+    result = subprocess.run(args, capture_output=True, text=True)
+    if result.returncode == 0:
+        return
+
+    # `gh issue edit` fails as a whole when any referenced label is missing in
+    # the repository, which used to leave the Issue on its previous status with
+    # no signal at all. Create the label, retry once, then report the failure.
+    if ensure_status_label(repo, target_label):
+        retry = subprocess.run(args, capture_output=True, text=True)
+        if retry.returncode == 0:
+            return
+        result = retry
+
+    detail = (result.stderr or result.stdout or "").strip().splitlines()
+    log_warn(
+        f"Issue #{issue_number} status label not updated to {target_label}"
+        + (f": {detail[0]}" if detail else "")
+    )
 
 
-def sync_plan_to_issue_body(issue_number: int, plan_file: str, repo: str, workspace_root: str = None) -> None:
-    """Sync Plan link row in Issue's Related Resources section.
-    
-    Only updates the | Plan | ... | row, preserving all other Issue body content.
+# ============================================
+# Plan -> Issue sync pipeline (extract -> render -> replace)
+# ============================================
+
+def _find_section_span(text: str, heading: str) -> tuple[int, int] | None:
+    """Locate the body span of a top-level '## {heading}' section.
+
+    Fence-aware: '## ' lines inside fenced code blocks are ignored. Returns
+    (body_start, body_end) where body_start is the offset just past the heading
+    line and body_end is the offset of the next top-level heading line (or the
+    end of text). Returns None when the heading is absent.
+    """
+    pos = 0
+    in_code = False
+    body_start = None
+    for line in text.splitlines(keepends=True):
+        if line.strip().startswith('```'):
+            in_code = not in_code
+        elif not in_code:
+            if body_start is None:
+                if line.strip() == f"## {heading}":
+                    body_start = pos + len(line)
+            elif re.match(r'^##(?:\s|$)', line):
+                return (body_start, pos)
+        pos += len(line)
+    if body_start is not None:
+        return (body_start, len(text))
+    return None
+
+
+def _has_section(text: str, heading: str) -> bool:
+    """Whether a top-level '## {heading}' section exists (fence-aware)."""
+    return _find_section_span(text, heading) is not None
+
+
+def extract_plan_section(plan_file: str, section: str, limit: int = 0) -> str:
+    """Extract a top-level '## {section}' body from a Plan file.
+
+    Fence-aware: fenced code content is preserved verbatim and '## ' lines
+    inside fenced blocks do not terminate the section.
+    """
+    path = Path(plan_file)
+    if not path.exists():
+        return ""
+
+    text = path.read_text()
+    span = _find_section_span(text, section)
+    if span is None:
+        return ""
+
+    content = text[span[0]:span[1]].strip()
+    if limit > 0:
+        content = "\n".join(content.splitlines()[:limit]).strip()
+    return content
+
+
+def extract_acceptance_criteria(plan_file: str) -> str:
+    """Extract the Plan's Acceptance Criteria with numbered checkboxes converted.
+
+    The '### Agent Verification' / '### User Validation' sub-sections are kept;
+    numbered checkboxes (1. [ ] / 1. [x]) become GitHub-compatible - [ ] / - [x].
+    """
+    content = extract_plan_section(plan_file, "Acceptance Criteria")
+
+    converted = re.sub(r'^(\s*)(\d+)\.\s+\[\s*\]', r'\1- [ ]', content, flags=re.MULTILINE)
+    converted = re.sub(r'^(\s*)(\d+)\.\s+\[x\]', r'\1- [x]', converted, flags=re.MULTILINE)
+
+    return converted
+
+
+def _render_scope_section_body(in_scope: str, out_of_scope: str) -> str:
+    """Render Plan In/Out scope content as the canonical '### In'/'### Out' body."""
+    return f"### In\n\n{in_scope}\n\n### Out\n\n{out_of_scope}"
+
+
+def _replace_section_body(body: str, heading: str, new_content: str) -> str:
+    """Replace a section's body in place, keeping its heading line.
+
+    Normalizes the spacing around the new content to exactly one blank line.
+    Returns the body unchanged when the heading is absent.
+    """
+    span = _find_section_span(body, heading)
+    if span is None:
+        return body
+    start, end = span
+    suffix = "\n" if end >= len(body) else "\n\n"
+    return body[:start] + f"\n{new_content}{suffix}" + body[end:]
+
+
+def build_synced_issue_body(current_body: str, plan_file: str, plan_name: str,
+                            repo: str, workspace_root: str = None) -> str:
+    """Build the synced Issue body: three mapped sections + Plan link row.
+
+    Replaces the bodies of Issue '## Goal', '## Scope' and
+    '## Acceptance Criteria' with the Plan's mapped sections ('## Scope'
+    renders as '### In' / '### Out'; legacy '## In Scope' / '## Out of Scope'
+    headings are updated in place) and updates the '| Plan |' row. Every byte
+    outside these ranges is preserved. Missing Plan sections or missing Issue
+    targets are skipped with a warning; syncing is idempotent.
+    """
+    body = current_body
+
+    if _has_section(body, "Goal"):
+        goal = extract_plan_section(plan_file, "Goal")
+        if goal:
+            body = _replace_section_body(body, "Goal", goal)
+        else:
+            log_warn("Plan has no 'Goal' section; Issue '## Goal' not synced")
+    else:
+        log_warn("Issue body has no '## Goal' section; skipped")
+
+    in_scope = extract_plan_section(plan_file, "In Scope")
+    out_of_scope = extract_plan_section(plan_file, "Out of Scope")
+    if _has_section(body, "Scope"):
+        if in_scope and out_of_scope:
+            body = _replace_section_body(
+                body, "Scope", _render_scope_section_body(in_scope, out_of_scope))
+        else:
+            log_warn("Plan is missing 'In Scope'/'Out of Scope'; Issue '## Scope' not synced")
+    else:
+        scope_targets = (("In Scope", in_scope), ("Out of Scope", out_of_scope))
+        legacy_found = any(_has_section(body, heading) for heading, _ in scope_targets)
+        for heading, content in scope_targets:
+            if not _has_section(body, heading):
+                continue
+            if content:
+                body = _replace_section_body(body, heading, content)
+            else:
+                log_warn(f"Plan has no '{heading}' section; Issue '## {heading}' not synced")
+        if not legacy_found:
+            log_warn("Issue body has no '## Scope' (or legacy '## In Scope'/'## Out of Scope'); skipped")
+
+    if _has_section(body, "Acceptance Criteria"):
+        criteria = extract_acceptance_criteria(plan_file)
+        if criteria:
+            body = _replace_section_body(body, "Acceptance Criteria", criteria)
+        else:
+            log_warn("Plan has no 'Acceptance Criteria' section; Issue '## Acceptance Criteria' not synced")
+    else:
+        log_warn("Issue body has no '## Acceptance Criteria' section; skipped")
+
+    _, _, _build_plan_link = _get_plan_functions()
+    plan_row = _build_plan_link(plan_file, plan_name, repo, workspace_root)
+    if plan_row:
+        body = replace_plan_row_in_body(body, plan_row)
+
+    return body
+
+
+def sync_plan_to_issue_body(issue_number: int, plan_file: str, repo: str, workspace_root: str = None) -> bool:
+    """Sync the three mapped sections and the Plan link row to the Issue body.
+
+    The Issue's '## Goal', '## Scope' and '## Acceptance Criteria' bodies are
+    replaced from the Plan and the '| Plan |' row is updated; every byte outside
+    those ranges is preserved (surgical, idempotent). Missing sections are
+    skipped with a warning; nothing is inserted for a missing target.
+
+    Returns True when the sync succeeded (including the already-in-sync no-op),
+    False when it could not be performed (missing plan, gh unavailable, Issue
+    fetch or edit failure).
     """
     if not repo:
-        return
-    
+        return False
+
     if not Path(plan_file).exists():
-        return
-    
+        return False
+
     try:
         subprocess.run(['gh', '--version'], capture_output=True, check=True)
     except (subprocess.CalledProcessError, FileNotFoundError):
-        return
-    
-    _, _, _build_issue_body = _get_plan_functions()
-    plan_name = Path(plan_file).stem
-    new_plan_row = _build_issue_body(plan_file, plan_name, repo, workspace_root)
-    
-    if not new_plan_row or "待关联" in new_plan_row:
-        return
-    
+        return False
+
     current_body = _get_issue_body(issue_number, repo)
     if current_body is None:
-        return
-    
-    new_body = _replace_plan_row_in_body(current_body, new_plan_row)
+        return False
+
+    plan_name = Path(plan_file).stem
+    new_body = build_synced_issue_body(current_body, plan_file, plan_name, repo, workspace_root)
+
     if new_body == current_body:
-        return
-    
-    subprocess.run(
+        return True
+
+    result = subprocess.run(
         ['gh', 'issue', 'edit', str(issue_number), '--repo', repo, '--body', new_body],
         capture_output=True,
     )
+    return result.returncode == 0
 
 
 def _get_issue_body(issue_number: int, repo: str) -> str | None:
@@ -383,12 +534,22 @@ def _get_issue_body(issue_number: int, repo: str) -> str | None:
             ['gh', 'issue', 'view', str(issue_number), '--repo', repo, '--json', 'body', '--jq', '.body'],
             capture_output=True, text=True, check=True,
         )
-        return result.stdout
+        # `gh --jq` prints one trailing newline after the string; strip exactly
+        # that one so edits write back the body's real bytes (no +1 growth).
+        body = result.stdout
+        return body[:-1] if body.endswith("\n") else body
     except (subprocess.CalledProcessError, FileNotFoundError):
         return None
 
 
-def _replace_plan_row_in_body(current_body: str, new_plan_row: str) -> str:
+def replace_plan_row_in_body(current_body: str, new_plan_row: str) -> str:
+    """Replace the '| Plan |' row, scoped to the Related Resources section.
+
+    The single row-replacement primitive shared by the sync pipeline
+    (build_synced_issue_body) and the archive link refresh
+    (plan.update_issue_plan_link). Falls back to appending the row — or the
+    whole Related Resources section — when it is absent.
+    """
     plan_row_pattern = re.compile(r'\| Plan \| .+ \|')
     rr_match = re.search(r'^##\s+Related Resources\s*$', current_body, re.MULTILINE)
     if rr_match:
@@ -410,23 +571,6 @@ def plan_project_to_issue_label(project: str) -> str:
     if project:
         return f"project/{project}"
     return ""
-
-
-def _get_project_labels_from_issue(issue_number: int | str, repo: str) -> list[str]:
-    """Get all project/* labels currently on an issue."""
-    result = subprocess.run(
-        ['gh', 'issue', 'view', str(issue_number), '--repo', repo, '--json', 'labels', '-q', '.'],
-        capture_output=True, text=True,
-    )
-    if result.returncode != 0:
-        return []
-    
-    try:
-        labels = json.loads(result.stdout)
-    except json.JSONDecodeError:
-        return []
-    
-    return [l['name'] for l in labels if re.match(r'^project/', l.get('name', ''))]
 
 
 def ensure_issue_labels(issue_number: int, plan_file: str, repo: str) -> None:
@@ -497,25 +641,52 @@ def sync_type_label_group(issue_number: int, target_label: str, repo: str) -> No
 
 
 def sync_project_label_group(issue_number: int, target_label: str, repo: str) -> None:
-    """Sync project label group on Issue.
-    
-    Dynamically removes any project/* labels and adds the target.
-    """
+    """Ensure one project label exists without removing other projects."""
     current_labels = get_issue_labels(issue_number, repo)
-    
-    labels_to_remove = [l for l in current_labels if re.match(r'^project/', l) and l != target_label]
-    labels_to_add = [target_label] if target_label not in current_labels else []
-    
-    if not labels_to_add and not labels_to_remove:
+
+    if target_label in current_labels:
         return
-    
+
+    ensure_label_exists(target_label, repo)
+    args = ['gh', 'issue', 'edit', str(issue_number), '--repo', repo]
+    args.extend(['--add-label', target_label])
+    subprocess.run(args, capture_output=True)
+
+
+def remove_project_label(issue_number: int | str, target_label: str, repo: str) -> None:
+    """Remove one project label without modifying any other project labels."""
+    current_labels = get_issue_labels(issue_number, repo)
+    if target_label not in current_labels:
+        return
+
+    subprocess.run(
+        ['gh', 'issue', 'edit', str(issue_number), '--repo', repo,
+         '--remove-label', target_label],
+        capture_output=True,
+    )
+
+
+def remove_status_labels(
+    issue_number: int | str,
+    repo: str,
+    current_labels: list[str] | None = None,
+) -> bool:
+    """Remove every active dev-flow status label from an Issue.
+
+    Returns False when GitHub rejects the mutation so callers can stop before
+    performing a later irreversible action such as closing the Issue.
+    """
+    if current_labels is None:
+        current_labels = get_issue_labels(issue_number, repo)
+    labels_to_remove = [label for label in STATUS_LABELS if label in current_labels]
+    if not labels_to_remove:
+        return True
+
     args = ['gh', 'issue', 'edit', str(issue_number), '--repo', repo]
     for label in labels_to_remove:
         args.extend(['--remove-label', label])
-    for label in labels_to_add:
-        args.extend(['--add-label', label])
-    
-    subprocess.run(args, capture_output=True)
+    result = subprocess.run(args, capture_output=True, text=True)
+    return result.returncode == 0
 
 
 def sync_status_label_group(issue_number: int | str, target_label: str, repo: str) -> None:

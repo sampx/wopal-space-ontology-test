@@ -11,6 +11,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from support.bootstrap import ensure_scripts_path
 ensure_scripts_path()
 
+from support.git_fixtures import (
+    init_repo as _shell_init_repo,
+    install_failing_hook as _shell_install_failing_hook,
+    shell_git as _shell_git,
+)
+
 
 # -- Fixtures -----------------------------------------------------------------
 
@@ -29,24 +35,6 @@ PLAN_VERIFYING_STANDARD = """\
   - base_branch: main
   - merge_target: main
   - verify_mode: direct
-  - cleanup_policy: archive
-"""
-
-PLAN_VERIFYING_ONTOLOGY = """\
-- **Status**: verifying
-- **Type**: refactor
-- **Target Project**: wopal-space-ontology
-- **Project Type**: ontology-worktree
-- **Project Path**: .wopal
-- **Issue**: #10
-- **Worktree**:
-  - enabled: true
-  - branch: issue-10-slug
-  - path: .worktrees/ontology-issue-10-slug
-  - repo_root: /home/.wopal/ontologies/wopal-space-ontology
-  - base_branch: space/main
-  - merge_target: space/main
-  - verify_mode: switch-runtime
   - cleanup_policy: archive
 """
 
@@ -69,44 +57,35 @@ def _write_plan(tmp_path, content: str, name: str = "42-feature-dev-flow-test.md
     return plan_file
 
 
-# -- Test: Final Commit recording -------------------------------------------------
+def test_recorded_integration_commit_is_delivery_identity_not_current_head(tmp_path):
+    """verify accepts the recorded formal commit even after main advances later."""
+    from commands.verify import _check_recorded_integration
 
-class TestVerifyRecordsFinalCommit:
-    """verify 应记录 Final Commit(合入后集成分支 HEAD)到 Plan metadata。"""
+    project = tmp_path / "projects" / "gesp"
+    _shell_init_repo(project)
+    (project / "delivery.txt").write_text("delivered\n")
+    _shell_git("add", "delivery.txt", cwd=project)
+    subject = "feat(gesp): exact delivery"
+    _shell_git("commit", "-m", subject, cwd=project)
+    integration_commit = _shell_git("rev-parse", "HEAD", cwd=project).stdout.strip()
+    (project / "later.txt").write_text("later\n")
+    _shell_git("add", "later.txt", cwd=project)
+    _shell_git("commit", "-m", "chore: later unrelated work", cwd=project)
 
-    def test_final_commit_records_integration_head(self, tmp_path):
-        """Final Commit 应取集成分支 HEAD(standard: main)。"""
-        from commands.verify import _record_final_commit
-        plan_path = _write_plan(tmp_path, PLAN_VERIFYING_STANDARD)
-        proj_dir = tmp_path / "projects" / "gesp"
-        proj_dir.mkdir(parents=True)
-        (proj_dir / ".git").mkdir()
+    plan = _write_plan(
+        tmp_path,
+        f"""- **Status**: verifying
+- **Project Path**: projects/gesp
+- **Delivery**: 42-feature-dev-flow-test
+- **Commit Subject**: {subject}
+- **Integration Branch**: main
+- **Work Branch**: work-delivery
+- **Verification Commit**: work-tip-123
+- **Integration Commit**: {integration_commit}
+""",
+    )
 
-        with patch("commands.verify.get_branch_head", return_value="deadbeef") as mock_head:
-            with patch("commands.verify.set_plan_field", return_value=True) as mock_set:
-                _record_final_commit(str(plan_path), tmp_path)
-
-        mock_head.assert_called_once()
-        mock_set.assert_called_once_with(
-            str(plan_path), "Final Commit", "deadbeef"
-        )
-
-    def test_final_commit_uses_main_branch(self, tmp_path):
-        """standard 项目 Final Commit 用 main 分支;ontology 用当前空间分支。"""
-        from commands.verify import _record_final_commit
-        plan_path = _write_plan(tmp_path, PLAN_VERIFYING_STANDARD)
-        proj_dir = tmp_path / "projects" / "gesp"
-        proj_dir.mkdir(parents=True)
-        (proj_dir / ".git").mkdir()
-
-        with patch("commands.verify.get_branch_head", return_value="abc123") as mock_head:
-            with patch("commands.verify.set_plan_field", return_value=True):
-                _record_final_commit(str(plan_path), tmp_path)
-
-        cmd = mock_head.call_args[0][0]
-        assert cmd == str(tmp_path / "projects" / "gesp")
-        branch = mock_head.call_args[0][1]
-        assert branch == "main"
+    assert _check_recorded_integration(str(plan), tmp_path) == 0
 
 
 # -- Test: _check_feature_branch_merged function -------------------------------
@@ -174,59 +153,6 @@ class TestCheckFeatureBranchMerged:
         assert result == 1
         mock_log.assert_any_call(
             "Feature branch 'feature/test-1-slug' not yet merged to main. "
-            "Please merge first."
-        )
-
-    def test_ontology_branch_merged_returns_zero(self, tmp_path):
-        """Ontology-worktree: feature branch is in merged list, returns 0."""
-        from commands.verify import _check_feature_branch_merged
-
-        plan_path = _write_plan(tmp_path, PLAN_VERIFYING_ONTOLOGY)
-        wopal_dir = tmp_path / ".wopal"
-        wopal_dir.mkdir(parents=True)
-        (wopal_dir / ".git").mkdir()
-
-        merged_output = "  space/wopal-workspace\n* issue-10-slug\n"
-
-        with patch("lib.git.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(
-                returncode=0,
-                stdout=merged_output,
-            )
-            with patch("lib.git.get_current_branch", return_value="space/wopal-workspace"):
-                result = _check_feature_branch_merged(tmp_path, str(plan_path))
-
-        assert result == 0
-
-    def test_ontology_branch_not_merged_returns_one(self, tmp_path):
-        """Ontology-worktree: feature branch NOT in merged list, returns 1."""
-        from commands.verify import _check_feature_branch_merged
-
-        plan_path = _write_plan(tmp_path, PLAN_VERIFYING_ONTOLOGY)
-        wopal_dir = tmp_path / ".wopal"
-        wopal_dir.mkdir(parents=True)
-        (wopal_dir / ".git").mkdir()
-
-        # Subprocess calls: local merged, tree x2, remote merged, git log --grep
-        def fake_run(cmd, *args, **kwargs):
-            if cmd[0] == "git" and cmd[1] == "branch" and "--merged" in cmd and "-r" not in cmd:
-                return MagicMock(returncode=0, stdout="  space/wopal-workspace\n")
-            if "rev-parse" in cmd and any("^{tree}" in c for c in cmd):
-                if any("issue-10-slug" in c for c in cmd):
-                    return MagicMock(returncode=0, stdout="tree-diff-feature\n")
-                return MagicMock(returncode=0, stdout="tree-diff-main\n")
-            if cmd[1] == "branch" and "-r" in cmd:
-                return MagicMock(returncode=0, stdout="")
-            return MagicMock(returncode=0, stdout="")
-
-        with patch("lib.git.subprocess.run", side_effect=fake_run):
-            with patch("lib.git.get_current_branch", return_value="space/wopal-workspace"):
-                with patch("lib.git.log_error") as mock_log:
-                    result = _check_feature_branch_merged(tmp_path, str(plan_path))
-
-        assert result == 1
-        mock_log.assert_any_call(
-            "Feature branch 'issue-10-slug' not yet merged to space/wopal-workspace. "
             "Please merge first."
         )
 
@@ -302,68 +228,149 @@ class TestCheckFeatureBranchMerged:
         assert "--merged" in cmd
         assert "main" in cmd
 
-        # Ontology → current .wopal/ branch (dynamically detected)
-        plan_path_ont = _write_plan(
-            tmp_path, PLAN_VERIFYING_ONTOLOGY, name="10-ont.md"
-        )
-        wopal_dir = tmp_path / ".wopal"
-        wopal_dir.mkdir(parents=True)
-        (wopal_dir / ".git").mkdir()
+# ============================================
+# cmd_verify durability gate (Task 4, AC#6)
+# ============================================
+#
+# Real construction: a temp workspace repo holding a verifying Plan and a
+# project repo supplying the no-worktree Verification Commit. The Plan rewrite, the git commit and
+# the retry run for real; network side effects (PR lookups / Issue sync /
+# gh close) are mocked so the failure path can assert they are unreached.
 
-        def fake_run_ont(cmd, *args, **kwargs):
-            if cmd[0] == "git" and cmd[1] == "branch" and "--merged" in cmd and "-r" not in cmd:
-                return MagicMock(returncode=0, stdout="  space/wopal-workspace\n* issue-10-slug\n")
-            return MagicMock(returncode=0, stdout="")
+VERIFY_PLAN_REL = ".wopal-space/plans/ontology/204-fix-verifying-plan.md"
 
-        with patch("lib.git.subprocess.run", side_effect=fake_run_ont) as mock_run:
-            with patch("lib.git.get_current_branch", return_value="space/wopal-workspace"):
-                _check_feature_branch_merged(tmp_path, str(plan_path_ont))
+VERIFY_PLAN_TEMPLATE = """\
+# 204-fix-verifying-plan
 
-        merged_calls = [
-            c.args[0] for c in mock_run.call_args_list
-            if "--merged" in c.args[0]
-        ]
-        assert merged_calls, "expected git branch --merged call"
-        cmd = merged_calls[0]
-        assert "--merged" in cmd
-        assert "space/wopal-workspace" in cmd
+## Metadata
 
-    def test_ontology_integration_branch_is_dynamic_current_branch(self, tmp_path):
-        """Ontology integration branch is the current .wopal/ branch, detected
-        at runtime — not a hardcoded value.
+- **Issue**: #204
+- **Type**: fix
+- **Target Project**: gesp
+- **Project Type**: standard
+- **Project Path**: projects/gesp
+- **Status**: verifying
+- **Integration Branch**: main
+- **Work Branch**: (none)
+- **Verification Commit**: (none)
+- **Integration Commit**: (none)
 
-        Regression: previously hardcoded 'space/main', which broke non-main
-        spaces (e.g. space/wopal-workspace, space/gesp-space)."""
-        from commands.verify import _check_feature_branch_merged
+## Goal
 
-        plan_path = _write_plan(tmp_path, PLAN_VERIFYING_ONTOLOGY, name="10-dyn.md")
-        wopal_dir = tmp_path / ".wopal"
-        wopal_dir.mkdir(parents=True)
-        (wopal_dir / ".git").mkdir()
+Verifying plan used by the verify durability-gate tests.
 
-        # Simulate a different space name to prove the value is dynamic
-        current_space_branch = "space/gesp-space"
+## Acceptance Criteria
 
-        def fake_run(cmd, *args, **kwargs):
-            if cmd[0] == "git" and cmd[1] == "branch" and "--merged" in cmd and "-r" not in cmd:
-                return MagicMock(
-                    returncode=0,
-                    stdout=f"  {current_space_branch}\n* issue-10-slug\n",
-                )
-            return MagicMock(returncode=0, stdout="")
+### User Validation
 
-        with patch("lib.git.subprocess.run", side_effect=fake_run) as mock_run:
-            with patch("lib.git.get_current_branch", return_value=current_space_branch) as mock_branch:
-                result = _check_feature_branch_merged(tmp_path, str(plan_path))
+#### Scenario 1: gate behavior
+- Goal: confirm verify runs
+- Launch Command: `flow.sh verify 204 --confirm`
+- Pass Criteria: Plan reaches done
+
+- [x] 用户已完成上述功能验证并确认结果符合预期
+"""
+
+
+def _make_verify_workspace(tmp_path):
+    ws = tmp_path / "ws"
+    _shell_init_repo(ws)
+    _shell_init_repo(ws / "projects" / "gesp")
+    plan = ws / VERIFY_PLAN_REL
+    plan.parent.mkdir(parents=True)
+    plan.write_text(VERIFY_PLAN_TEMPLATE)
+    _shell_git("add", VERIFY_PLAN_REL, cwd=ws)
+    _shell_git("commit", "-m", "add plan", cwd=ws)
+    return ws, plan
+
+
+def _run_verify(ws, target="204"):
+    """Run cmd_verify with workspace/repo detection and network mocked."""
+    from argparse import Namespace
+
+    from commands.verify import cmd_verify
+
+    close_run = MagicMock(return_value=MagicMock(returncode=0))
+    sync_label = MagicMock()
+    sync_body = MagicMock()
+    with patch.multiple(
+        "commands.verify",
+        find_workspace_root=MagicMock(return_value=ws),
+        resolve_space_repo=MagicMock(return_value="test/space"),
+        sync_status_label=sync_label,
+        sync_plan_to_issue_body=sync_body,
+        _get_pr_url_from_issue=MagicMock(return_value=""),
+        _search_merged_pr_for_issue=MagicMock(return_value=False),
+        subprocess=MagicMock(run=close_run),
+    ):
+        result = cmd_verify(Namespace(target=target, confirm=True))
+    return result, sync_label, sync_body, close_run
+
+
+class TestVerifyDurabilityGate:
+    """A failed Plan commit must not reach Issue sync/close and must leave
+    the Plan retryable (AC#6)."""
+
+    def test_commit_failure_blocks_sync_and_close_and_restores_plan(
+        self, tmp_path, capsys
+    ):
+        ws, plan = _make_verify_workspace(tmp_path)
+        original = plan.read_text()
+        _shell_install_failing_hook(ws, "injected verify-commit failure")
+
+        result, sync_label, sync_body, close_run = _run_verify(ws)
+
+        assert result == 1
+        assert plan.read_text() == original
+        assert "- **Status**: verifying" in plan.read_text()
+        assert "- **Verification Commit**: (none)" in plan.read_text()
+        # No staged Plan residue: a retry sees the same clean state.
+        assert _shell_git(
+            "status", "--porcelain", "--", VERIFY_PLAN_REL, cwd=ws
+        ).stdout == ""
+        sync_label.assert_not_called()
+        sync_body.assert_not_called()
+        close_run.assert_not_called()
+        out, err = capsys.readouterr()
+        assert "injected verify-commit failure" in (out + err)
+
+    def test_retry_after_commit_failure_succeeds(self, tmp_path):
+        ws, plan = _make_verify_workspace(tmp_path)
+        hook = _shell_install_failing_hook(ws, "injected verify-commit failure")
+
+        first, _, _, _ = _run_verify(ws)
+        assert first == 1
+
+        hook.unlink()
+        second, sync_label, sync_body, close_run = _run_verify(ws)
+
+        assert second == 0
+        committed = _shell_git("show", f"HEAD:{VERIFY_PLAN_REL}", cwd=ws).stdout
+        assert "- **Status**: done" in committed
+        verification_commit = _shell_git(
+            "rev-parse", "main", cwd=ws / "projects" / "gesp"
+        ).stdout.strip()
+        assert f"- **Verification Commit**: {verification_commit}" in committed
+        assert "Final Commit" not in committed
+        assert _shell_git(
+            "log", "-1", "--format=%s", cwd=ws
+        ).stdout.strip() == "docs(plan): verify plan #204"
+        assert _shell_git(
+            "status", "--porcelain", "--", VERIFY_PLAN_REL, cwd=ws
+        ).stdout == ""
+        sync_label.assert_called_once_with(204, "done", "test/space")
+        sync_body.assert_called_once()
+        close_run.assert_called_once()
+        assert "close" in close_run.call_args[0][0]
+
+    def test_success_path_commits_done_and_syncs(self, tmp_path):
+        ws, plan = _make_verify_workspace(tmp_path)
+
+        result, sync_label, sync_body, close_run = _run_verify(ws)
 
         assert result == 0
-        # get_current_branch must have been called with .wopal/ repo root
-        mock_branch.assert_called_once_with(str(wopal_dir))
-        # git branch --merged must use the dynamically detected branch
-        merged_calls = [
-            c.args[0] for c in mock_run.call_args_list
-            if "--merged" in c.args[0]
-        ]
-        assert merged_calls, "expected git branch --merged call"
-        cmd = merged_calls[0]
-        assert current_space_branch in cmd
+        committed = _shell_git("show", f"HEAD:{VERIFY_PLAN_REL}", cwd=ws).stdout
+        assert "- **Status**: done" in committed
+        sync_label.assert_called_once()
+        sync_body.assert_called_once()
+        close_run.assert_called_once()

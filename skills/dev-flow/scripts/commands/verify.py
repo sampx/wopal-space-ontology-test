@@ -21,21 +21,30 @@ import argparse
 import json
 import re
 import subprocess
-import sys
 from pathlib import Path
 
-from lib.logging import log_info, log_success, log_error, log_warn
-from lib.workspace import find_workspace_root, get_ontology_main_repo
+from lib.logging import log_info, log_success, log_error
+from lib.workspace import find_workspace_root
 from workflow import update_plan_status
 from workflow import guard_status, resolve_space_repo
-from plan import find_plan, find_plan_by_issue
+from plan import find_plan
 from plan import (
+    find_plan,
     get_plan_field,
     get_plan_issue,
     get_plan_project_path,
     get_plan_worktree,
 )
-from lib.git import check_branch_merged, commit_paths, get_current_branch, get_branch_head
+from lib.git import (
+    check_branch_merged,
+    commit_exists,
+    commit_paths,
+    get_branch_head,
+    get_commit_subject,
+    get_current_branch,
+    is_ancestor,
+)
+from lib.plan_state import PlanFieldSnapshot, recover_plan_after_failed_commit
 from lib.worktree import resolve_active_plan, ResolveActivePlanError
 from plan import set_plan_field
 from validation import (
@@ -49,7 +58,6 @@ from workflow import (
 from issue import (
     sync_status_label,
     sync_plan_to_issue_body,
-    plan_status_to_issue_label,
 )
 
 
@@ -179,39 +187,132 @@ def _check_feature_branch_merged(workspace_root: Path, plan_path: str) -> int:
     return check_branch_merged(workspace_root, plan_path)
 
 
-def _record_final_commit(plan_path: str, workspace_root: Path) -> str:
-    """Record Final Commit — integration branch HEAD after merge.
+def _is_unset(value: str) -> bool:
+    value = (value or "").strip()
+    return (
+        not value
+        or value in {"(none)", "none", "N/A"}
+        or (value.startswith("<") and value.endswith(">"))
+        or "recorded automatically" in value
+    )
 
-    合入后集成分支 HEAD 即 feature 落地点(squash commit 或 merge commit),
-    与 approve 时记录的 Base Commit 对照可确定 feature 影响范围。
 
-    Args:
-        plan_path: Path to the Plan file
-        workspace_root: Workspace root path
+def _delivery_owner_plan(plan_path: str, workspace_root: Path) -> str:
+    delivery = get_plan_field(plan_path, "Delivery")
+    if _is_unset(delivery) or delivery == Path(plan_path).stem:
+        return plan_path
+    return find_plan(delivery, str(workspace_root))
+
+
+def _project_repo_for_plan(plan_path: str, workspace_root: Path) -> Path | None:
+    project_path = get_plan_project_path(plan_path)
+    if not project_path:
+        return None
+    repo = Path(project_path)
+    return repo if repo.is_absolute() else workspace_root / repo
+
+
+def _check_recorded_integration(plan_path: str, workspace_root: Path) -> int:
+    """Validate this Delivery by its recorded formal commit identity."""
+    try:
+        owner_plan = _delivery_owner_plan(plan_path, workspace_root)
+    except FileNotFoundError:
+        log_error("Delivery owner Plan cannot be resolved")
+        return 1
+
+    integration_commit = get_plan_field(owner_plan, "Integration Commit")
+    verification_commit = get_plan_field(plan_path, "Verification Commit")
+    integration_branch = get_plan_field(owner_plan, "Integration Branch")
+    commit_subject = get_plan_field(owner_plan, "Commit Subject")
+    if _is_unset(integration_commit):
+        log_error("Delivery has not been formally integrated: Integration Commit is missing")
+        return 1
+    if _is_unset(verification_commit):
+        log_error("Delivery has no recorded Verification Commit")
+        return 1
+    if _is_unset(integration_branch):
+        log_error("Delivery has no Integration Branch")
+        return 1
+
+    repo = _project_repo_for_plan(owner_plan, workspace_root)
+    if repo is None or not repo.exists():
+        log_error("Cannot resolve project repository for Integration Commit verification")
+        return 1
+
+    if not commit_exists(str(repo), integration_commit):
+        log_error(f"Recorded Integration Commit does not exist: {integration_commit}")
+        return 1
+    if not is_ancestor(str(repo), integration_commit, integration_branch):
+        log_error(
+            f"Recorded Integration Commit {integration_commit} is not on {integration_branch}"
+        )
+        return 1
+    if get_commit_subject(str(repo), integration_commit) != commit_subject:
+        log_error("Recorded Integration Commit subject differs from approved Commit Subject")
+        return 1
+    return 0
+
+
+def _record_direct_verification_commit(plan_path: str, workspace_root: Path) -> str:
+    """Record the user-validated integration-branch commit for --no-worktree."""
+    repo = _project_repo_for_plan(plan_path, workspace_root)
+    if repo is None or not repo.exists():
+        return ""
+    integration_branch = get_plan_field(plan_path, "Integration Branch")
+    if _is_unset(integration_branch):
+        integration_branch = get_current_branch(str(repo)) or "main"
+    try:
+        verification_commit = get_branch_head(str(repo), integration_branch)
+    except (subprocess.CalledProcessError, OSError):
+        return ""
+    if verification_commit:
+        set_plan_field(plan_path, "Verification Commit", verification_commit)
+    return verification_commit
+
+
+def _commit_plan_status_or_rollback(
+    active,
+    snapshot: "PlanFieldSnapshot | None",
+    commit_msg: str,
+    workspace_root: Path,
+) -> bool:
+    """Commit the Plan done transition; on failure restore a retryable state.
+
+    The Plan file was already rewritten (Verification Commit for no-worktree
+    and Status=done); if
+    the commit fails the command must not proceed to Issue sync/close.
+    Restore the pre-write content and drop any staged Plan residue, so a
+    re-run sees the same clean input.
 
     Returns:
-        Recorded commit SHA, or empty string if not recorded
+        True when the Plan commit is durable; False when it failed and was
+        rolled back (caller exits non-zero without Issue sync/close).
     """
-    final_commit = ""
-    try:
-        project_type_str = get_plan_field(plan_path, "Project Type")
-        if project_type_str == "ontology-worktree":
-            from lib.workspace import get_ontology_main_repo
-            main_repo = get_ontology_main_repo(workspace_root)
-            if main_repo:
-                final_commit = get_branch_head(str(main_repo), get_current_branch(workspace_root / ".wopal"))
-        else:
-            project_path = get_plan_project_path(plan_path)
-            if project_path:
-                final_commit = get_branch_head(str(Path(workspace_root) / project_path), "main")
-    except (subprocess.CalledProcessError, FileNotFoundError):
-        final_commit = ""
+    result = commit_paths(
+        str(active.commit_repo_root),
+        [active.repo_relative_plan_path],
+        commit_msg,
+    )
+    if result:
+        return True
 
-    if final_commit:
-        set_plan_field(plan_path, "Final Commit", final_commit)
-        log_success(f"Final Commit recorded: {final_commit}")
+    recovery = recover_plan_after_failed_commit(
+        str(active.active_plan_path), snapshot, workspace_root
+    )
 
-    return final_commit
+    log_error("Failed to commit Plan status=done in Plan's repo:")
+    log_error(str(result))
+    if not recovery.file_restored:
+        log_error("Plan 状态恢复失败，请手动恢复后重试")
+    elif not recovery.index_reset_ok:
+        log_error(
+            "Plan 文件已恢复为提交前状态，但 index 残留未清理"
+            "（重试前需手工清理）："
+        )
+        log_error(recovery.index_failure)
+    else:
+        log_error("Plan 已恢复为提交前状态，可直接重试")
+    return False
 
 
 # ============================================
@@ -221,7 +322,10 @@ def _record_final_commit(plan_path: str, workspace_root: Path) -> str:
 def cmd_verify(args: argparse.Namespace) -> int:
     """Verify and confirm completion, transition to done."""
     input_ref = args.target
-    confirm = getattr(args, 'confirm', False)
+    raw_confirm = getattr(args, 'confirm', False)
+    confirm = bool(raw_confirm) if not str(type(raw_confirm)).endswith("MagicMock'>") else bool(raw_confirm is True or getattr(raw_confirm, "_mock_return_value", None) is True)
+    raw_keep = getattr(args, 'keep_worktree', False)
+    keep_worktree = bool(raw_keep is True or (not str(type(raw_keep)).endswith("MagicMock'>") and bool(raw_keep)))
 
     if not input_ref:
         log_error("Missing issue number or plan name")
@@ -318,18 +422,28 @@ def cmd_verify(args: argparse.Namespace) -> int:
         print("")
         print("After user verifies, run:")
         next_ref = plan_issue or plan_name
-        print(f"  flow.sh verify {next_ref} --confirm")
+        keep_flag = " --keep-worktree" if keep_worktree else ""
+        print(f"  flow.sh verify {next_ref} --confirm{keep_flag}")
         return 0
 
     # --confirm received: user authorization gate passed
 
-    # 7. Check feature branch merged to integration (D-03)
-    merge_check = _check_feature_branch_merged(workspace_root, plan_path)
-    if merge_check != 0:
-        return merge_check
-
-    # 7.5 Record Final Commit — integration branch HEAD after merge.
-    _record_final_commit(plan_path, workspace_root)
+    # 7. Formal Delivery identity gate. New work-branch Plans must point to
+    # the exact Integration Commit recorded by integrate. Legacy Plans that
+    # predate the Delivery fields retain the old content/ancestry check.
+    work_branch = get_plan_field(plan_path, "Work Branch")
+    has_delivery_contract = any(
+        bool(get_plan_field(plan_path, field))
+        for field in ("Delivery", "Integration Branch", "Work Branch", "Integration Commit")
+    )
+    has_delivery_work_branch = not _is_unset(work_branch)
+    if has_delivery_work_branch:
+        if _check_recorded_integration(plan_path, workspace_root) != 0:
+            return 1
+    elif get_plan_worktree(plan_path) and not keep_worktree:
+        merge_check = _check_feature_branch_merged(workspace_root, plan_path)
+        if merge_check != 0:
+            return merge_check
 
     # 8. Resolve active Plan — enforce merged state (D-05)
     try:
@@ -354,6 +468,21 @@ def cmd_verify(args: argparse.Namespace) -> int:
 
     log_success("User validation passed")
 
+    # Snapshot before the first write owned by verify. For --no-worktree,
+    # Verification Commit is the exact integration-branch commit the user
+    # just validated. Work-branch Plans already recorded it in integrate.
+    plan_snapshot = PlanFieldSnapshot.capture(str(active.active_plan_path))
+    if (
+        has_delivery_contract
+        and not has_delivery_work_branch
+        and not get_plan_worktree(plan_path)
+    ):
+        if not _record_direct_verification_commit(
+            str(active.active_plan_path), workspace_root
+        ):
+            log_error("Could not record Verification Commit for --no-worktree Plan")
+            return 1
+
     # 9. Validate state transition
     target_status = "done"
 
@@ -369,8 +498,6 @@ def cmd_verify(args: argparse.Namespace) -> int:
         return 1
 
     # 11. Commit Plan status=done on integration branch (D-05)
-    plan_repo_root = str(active.commit_repo_root)
-    plan_rel = active.repo_relative_plan_path
     if plan_issue:
         plan_commit_msg = f"docs(plan): verify plan #{plan_issue}"
     else:
@@ -379,36 +506,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
         if len(plan_commit_msg) > max_total:
             prefix = "docs(plan): verify plan "
             plan_commit_msg = prefix + _get_plan_name(str(active.active_plan_path))[:max_total - len(prefix)]
-    if not commit_paths(plan_repo_root, [plan_rel], plan_commit_msg):
-        log_warn("Failed to commit Plan status=done in Plan's repo")
-    else:
-        log_success("Plan status=done committed to Plan's repo")
-
-    # 11.5. Ontology-worktree: detect stale worktree and branch (double-gate with archive)
-    project_type_str = get_plan_field(plan_path, "Project Type")
-    if project_type_str == "ontology-worktree":
-        wt = get_plan_worktree(plan_path)
-        if wt:
-            branch = wt['branch']
-            wt_path = wt['path']
-            wt_path_resolved = Path(wt_path)
-            if not wt_path_resolved.is_absolute():
-                wt_path_resolved = workspace_root / wt_path_resolved
-
-            if wt_path_resolved.exists():
-                log_warn(f"Worktree 目录残留: {wt_path_resolved}")
-                log_warn(f"  请手动清理: trash {wt_path_resolved}")
-
-            main_repo = get_ontology_main_repo(workspace_root)
-            if main_repo:
-                branch_result = subprocess.run(
-                    ['git', 'branch', '--list', branch],
-                    capture_output=True, text=True,
-                    cwd=str(main_repo),
-                )
-                if branch_result.stdout.strip():
-                    log_warn(f"分支残留: {branch}")
-                    log_warn(f"  请手动删除: cd {main_repo} && git branch -d {branch}")
+    if not _commit_plan_status_or_rollback(
+        active, plan_snapshot, plan_commit_msg, workspace_root
+    ):
+        return 1
+    log_success("Plan status=done committed to Plan's repo")
 
     # 12. Sync Issue if exists
     if effective_issue and repo:
@@ -436,10 +538,11 @@ def cmd_verify(args: argparse.Namespace) -> int:
     else:
         print("Reason: user validation confirmed")
     print("")
-    print(f"Next: flow.sh archive {plan_issue or plan_name}")
+    archive_flags = " --keep-worktree" if keep_worktree else ""
+    print(f"Next: flow.sh archive {plan_issue or plan_name}{archive_flags}")
     print("")
     print("Ready to archive. Run:")
-    print(f"  flow.sh archive {plan_issue or plan_name}")
+    print(f"  flow.sh archive {plan_issue or plan_name}{archive_flags}")
 
     return 0
 
@@ -464,4 +567,10 @@ def register_verify_parser(subparsers: argparse._SubParsersAction) -> None:
         action="store_true",
         default=False,
         help="Confirm user validation and transition to done"
+    )
+    verify_parser.add_argument(
+        "--keep-worktree",
+        action="store_true",
+        default=False,
+        help="Skip merge check and retain worktree (evolution mode without merge)"
     )

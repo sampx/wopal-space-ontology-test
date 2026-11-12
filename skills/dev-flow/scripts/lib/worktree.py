@@ -5,19 +5,19 @@
 # Uses lib/workspace.py for workspace detection (not .workspace.md).
 #
 # Provides:
-#   - scan_projects: Scan workspace for git projects
 #   - create_worktree: Create a git worktree
-#   - list_worktrees: List worktrees filtered by base path
-#   - remove_worktree: Remove a git worktree (with --force fallback)
+#   - remove_worktree: Remove a git worktree using Git safety checks
 #   - delete_branch: Delete a local branch (with -D fallback)
 #   - clean_worktree: One-stop cleanup (remove_worktree + delete_branch)
 
 import os
 import re
 import subprocess
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 
+from lib.git import GitMutationFailure
+from lib.logging import log_warn
 from lib.project import resolve_plan_location
 
 
@@ -32,30 +32,20 @@ class WorktreeContext:
     Minimal fields written by write_worktree_context:
         branch: Worktree branch name
         path: Worktree directory path (relative to workspace root)
-        project_type: "standard" or "ontology-worktree" (from Plan metadata)
+        project_type: "standard" (from Plan metadata)
 
     Other info read from Plan Metadata:
         Project Path: repo root path (used instead of repo_root)
     """
     branch: str
     path: Path
-    project_type: str = "standard"  # "standard" | "ontology-worktree"
-
-
-def _worktree_field_name(field: str) -> str:
-    """Convert python field name to Plan metadata key.
-
-    e.g. 'project_type' -> 'project_type', 'verify_mode' -> 'verify_mode'
-    """
-    return field
+    project_type: str = "standard"
 
 
 def parse_worktree_context(plan_path: str) -> WorktreeContext | None:
     """Parse WorktreeContext from Plan metadata.
 
-    Supports two formats:
-    1. New structured format (indented list under Worktree heading)
-    2. Legacy format: "- **Worktree**: branch | path"
+    Supports the structured format (indented list under Worktree heading).
 
     Args:
         plan_path: Path to Plan markdown file
@@ -73,7 +63,7 @@ def parse_worktree_context(plan_path: str) -> WorktreeContext | None:
     # Worktree placeholders in design/scope sections.
     metadata_section = _extract_metadata_section(content)
 
-    # Try new structured format first
+    # Parse the structured format
     ctx = _parse_structured_worktree(metadata_section)
     if ctx is not None:
         # Read project_type from Plan metadata if not in WorktreeContext
@@ -81,15 +71,6 @@ def parse_worktree_context(plan_path: str) -> WorktreeContext | None:
             meta_type = _read_plan_project_type(metadata_section)
             if meta_type and meta_type != 'standard':
                 ctx.project_type = meta_type
-        return ctx
-
-    # Fallback to legacy format: "- **Worktree**: branch | path"
-    ctx = _parse_legacy_worktree(metadata_section)
-    if ctx is not None:
-        # Read project_type from Plan metadata
-        meta_type = _read_plan_project_type(metadata_section)
-        if meta_type:
-            ctx.project_type = meta_type
         return ctx
 
     return None
@@ -163,35 +144,10 @@ def _parse_structured_worktree(content: str) -> WorktreeContext | None:
         return None
 
 
-def _parse_legacy_worktree(content: str) -> WorktreeContext | None:
-    """Parse legacy '- **Worktree**: branch | path' format."""
-    pattern = r'^\- \*\*Worktree\*\*:\s*(.+)$'
-    match = re.search(pattern, content, re.MULTILINE)
-    if not match:
-        return None
-
-    raw = match.group(1).strip()
-    parts = raw.split('|', 1)
-    if len(parts) != 2:
-        return None
-
-    branch = parts[0].strip()
-    wt_path = parts[1].strip()
-
-    if not branch or not wt_path:
-        return None
-
-    return WorktreeContext(
-        branch=branch,
-        path=Path(wt_path),
-        project_type='standard',
-    )
-
-
 def write_worktree_context(plan_path: str, branch: str, path: str) -> bool:
     """Write minimal Worktree metadata to Plan file (branch + path only).
 
-    Replaces existing Worktree field (new or legacy format) with simplified block.
+    Replaces an existing structured Worktree field with the simplified block.
 
     Args:
         plan_path: Path to Plan markdown file
@@ -232,14 +188,6 @@ def write_worktree_context(plan_path: str, branch: str, path: str) -> bool:
         p.write_text(new_content)
         return True
 
-    # Try replacing legacy format
-    legacy_pattern = r'^\- \*\*Worktree\*\*:\s*.+$'
-    legacy_match = re.search(legacy_pattern, content, re.MULTILINE)
-    if legacy_match:
-        new_content = content[:legacy_match.start()] + new_block + content[legacy_match.end():]
-        p.write_text(new_content)
-        return True
-
     # No existing Worktree field — insert after Status field
     status_pattern = r'^\- \*\*Status\*\*:\s*.*$'
     status_match = re.search(status_pattern, content, re.MULTILINE)
@@ -255,7 +203,7 @@ def write_worktree_context(plan_path: str, branch: str, path: str) -> bool:
 def parse_worktree_meta(plan_path: str) -> dict | None:
     """Parse minimal Worktree metadata (branch + path) from Plan file.
 
-    Supports all formats: new 2-field, old 9-field structured, and legacy pipe.
+    Supports the structured format.
 
     Returns:
         {"branch": str, "path": str} if found, None otherwise.
@@ -380,34 +328,6 @@ def resolve_active_plan(
         repo_relative_plan_path=main_loc.repo_relative_path,
         branch_context="integration",
     )
-
-
-def scan_projects(workspace_root: Path) -> list[str]:
-    """Scan workspace root for git project directories.
-
-    Uses os.listdir to scan subdirectories, detecting those containing .git.
-    Does not depend on .workspace.md.
-
-    Args:
-        workspace_root: Workspace root path
-
-    Returns:
-        List of project directory names (not full paths)
-    """
-    projects = []
-    if not workspace_root.is_dir():
-        return projects
-
-    for entry in os.listdir(workspace_root):
-        entry_path = workspace_root / entry
-        if entry_path.is_dir():
-            git_path = entry_path / ".git"
-            if git_path.exists():
-                projects.append(entry)
-
-    return sorted(projects)
-
-
 def create_worktree(project_dir: Path, branch: str, worktree_base: Path) -> Path:
     """Create a git worktree for a project.
 
@@ -424,150 +344,290 @@ def create_worktree(project_dir: Path, branch: str, worktree_base: Path) -> Path
     """
     project_name = project_dir.name
     branch_slug = branch.replace("/", "-")
-    worktree_path = worktree_base / f"{project_name}-{branch_slug}"
+    # Worktree directory = branch (branch already contains the project prefix)
+    worktree_path = worktree_base / branch_slug
 
     # Ensure worktree_base exists
     worktree_base.mkdir(parents=True, exist_ok=True)
 
+    add_cmd = ["git", "worktree", "add", str(worktree_path), branch]
     result = subprocess.run(
-        ["git", "worktree", "add", str(worktree_path), branch],
+        add_cmd,
         cwd=str(project_dir),
         capture_output=True,
         text=True,
     )
 
     if result.returncode != 0:
+        first_attempt = GitMutationFailure.from_completed(
+            add_cmd, str(project_dir), result,
+        )
         # Try with HEAD if branch doesn't exist yet — create new branch
+        retry_cmd = ["git", "worktree", "add", "-b", branch, str(worktree_path), "HEAD"]
         result = subprocess.run(
-            ["git", "worktree", "add", "-b", branch, str(worktree_path), "HEAD"],
+            retry_cmd,
             cwd=str(project_dir),
             capture_output=True,
             text=True,
         )
         if result.returncode != 0:
+            second_attempt = GitMutationFailure.from_completed(
+                retry_cmd, str(project_dir), result,
+            )
             raise RuntimeError(
-                f"Failed to create worktree at {worktree_path}: {result.stderr.strip()}"
+                f"Failed to create worktree at {worktree_path}:\n"
+                f"  attempt 1: {first_attempt}\n"
+                f"  attempt 2: {second_attempt}"
             )
 
     return worktree_path
+def _find_worktree_path_by_branch(project_dir: Path, branch: str) -> Path | None:
+    """Locate a worktree's real registered path via `git worktree list`.
 
-
-def list_worktrees(worktree_base: Path, project: str | None = None) -> list[str]:
-    """List worktrees filtered by base path.
+    The git registry is authoritative; the branch-derived dir is only a
+    fallback.
 
     Args:
-        worktree_base: Base directory where worktrees are stored
-        project: Optional project name to filter by
+        project_dir: Path to the project's git root directory
+        branch: Branch name to locate
 
     Returns:
-        List of worktree paths (as strings)
+        Registered worktree path, or None if the branch is not registered
     """
-    # Find a git repo to run 'git worktree list' from
-    # walk up from worktree_base to find a git repo
-    search_dir = worktree_base
-    git_dir = None
-    for parent in [search_dir] + list(search_dir.parents):
-        if (parent / ".git").exists():
-            git_dir = parent
-            break
+    try:
+        result = subprocess.run(
+            ["git", "worktree", "list", "--porcelain"],
+            cwd=str(project_dir),
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
 
-    if git_dir is None:
-        return []
+    if result.returncode != 0:
+        return None
 
+    current_path: Path | None = None
+    for line in result.stdout.splitlines():
+        if line.startswith("worktree "):
+            current_path = Path(line[len("worktree "):].strip())
+        elif line.startswith("branch "):
+            branch_ref = line[len("branch "):].strip()
+            if branch_ref == f"refs/heads/{branch}":
+                return current_path
+    return None
+
+
+def _git_output(path: Path, *args: str) -> tuple[int, str]:
+    """Run Git in one worktree and return its exit code with combined output."""
+    cmd = ["git", "-C", str(path), *args]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    return result.returncode, (result.stdout + result.stderr).strip()
+
+
+def _local_only_work(worktree_path: Path) -> tuple[bool, list[str]]:
+    """Report tracked changes and local-only work in a worktree.
+
+    Returns:
+        (has_parent_changes, submodule_paths_with_local_work)
+
+    Ignored build and test output is intentionally excluded. A missing
+    submodule is not local work: it has not been initialized.
+    """
+    rc, lines = _git_output(
+        worktree_path, "status", "--porcelain", "--ignore-submodules=none",
+    )
+    if rc != 0:
+        return True, []
+    parent_lines = []
+    for line in lines.splitlines():
+        if line.startswith(" M ") or line.startswith("M  "):
+            continue
+        parent_lines.append(line)
+    parent_changed = bool(parent_lines)
+
+    registered = worktree_path / ".gitmodules"
+    if not registered.is_file():
+        return parent_changed, []
+
+    rc, names = _git_output(
+        worktree_path, "config", "-f", ".gitmodules", "--get-regexp",
+        r"^submodule\..*\.path$",
+    )
+    if rc != 0:
+        return parent_changed, []
+
+    unsafe: list[str] = []
+    for relative in (
+        line.split(maxsplit=1)[1] for line in names.splitlines() if " " in line
+    ):
+        child = worktree_path / relative
+        if not child.is_dir():
+            continue
+        rc, _ = _git_output(child, "rev-parse", "--git-dir")
+        if rc != 0:
+            continue
+        rc, dirty = _git_output(
+            child, "status", "--porcelain", "--ignore-submodules=none",
+        )
+        if rc != 0 or dirty:
+            unsafe.append(relative)
+            continue
+
+        pinned_rc, pinned = _git_output(worktree_path, "rev-parse", ":" + relative)
+        head_rc, head = _git_output(child, "rev-parse", "HEAD")
+        if pinned_rc != 0 or head_rc != 0 or pinned.strip() != head.strip():
+            unsafe.append(relative)
+            continue
+        rc, containing = _git_output(
+            child, "branch", "-r", "--contains", head.strip(),
+        )
+        if rc != 0 or not containing:
+            unsafe.append(relative)
+    return parent_changed, unsafe
+
+
+def _remove_clean_worktree(
+    project_dir: Path, worktree_path: Path, *, allow_force: bool,
+) -> None:
+    """Remove one worktree after confirming no local-only work remains."""
+    parent_changed, unsafe_submodules = _local_only_work(worktree_path)
+    if parent_changed or unsafe_submodules:
+        details = []
+        if parent_changed:
+            details.append("tracked or untracked files")
+        if unsafe_submodules:
+            details.append(
+                "local-only submodule work: " + ", ".join(unsafe_submodules)
+            )
+        raise RuntimeError("\n".join([
+            f"Failed to remove worktree {worktree_path}:",
+            "Preserved " + "; ".join(details) + ".",
+            "Save or publish it, then rerun cleanup.",
+        ]))
+
+    cmd = ["git", "worktree", "remove"]
+    if allow_force:
+        cmd.append("--force")
+    cmd.append(str(worktree_path))
+    result = subprocess.run(cmd, cwd=str(project_dir), capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError("\n".join([
+            f"Failed to remove worktree {worktree_path}:",
+            str(GitMutationFailure.from_completed(cmd, str(project_dir), result)),
+        ]))
+
+
+def remove_worktree_path(project_dir: Path, worktree_path: Path) -> None:
+    """Remove one worktree by path, preserving local-only work."""
+    if not worktree_path.exists():
+        return
     result = subprocess.run(
-        ["git", "worktree", "list", "--porcelain"],
-        cwd=str(git_dir),
+        ["git", "worktree", "remove", str(worktree_path)],
+        cwd=str(project_dir),
         capture_output=True,
         text=True,
     )
-
     if result.returncode != 0:
-        return []
-
-    # Parse porcelain output: each worktree is separated by blank lines
-    # Lines start with "worktree " followed by the path
-    worktrees = []
-    for line in result.stdout.strip().split('\n'):
-        if line.startswith("worktree "):
-            wt_path = line[len("worktree "):]
-            # Filter by worktree_base prefix
-            try:
-                wt = Path(wt_path)
-                if wt.is_relative_to(worktree_base) or str(wt).startswith(str(worktree_base)):
-                    if project is None or project in wt.name:
-                        worktrees.append(wt_path)
-            except (ValueError, OSError):
-                pass
-
-    return worktrees
+        _remove_clean_worktree(project_dir, worktree_path, allow_force=True)
 
 
-def remove_worktree(project_dir: Path, branch: str, worktree_base: Path) -> None:
-    """Remove a git worktree (equivalent to worktree.sh cmd_remove).
+def remove_worktree(project_dir: Path, branch: str, worktree_base: Path) -> list[str]:
+    """Remove a git worktree, preserving any local-only work.
 
-    Tries git worktree remove, then --force on failure.
-    Always runs git worktree prune afterwards.
+    Normal removal is tried first. Git's refusal is inspected rather than
+    blindly force-deleted: ignored build and test output is safe to remove,
+    while tracked changes, non-ignored untracked files, and submodule state
+    that is not fully reproducible must stop cleanup.
+    Always runs git worktree prune after a successful removal.
 
     Args:
         project_dir: Path to the project's git root directory
         branch: Branch name of the worktree
         worktree_base: Base directory where worktrees are stored
 
+    Returns:
+        List of prune problem descriptions (empty when clean). Removal
+        failures still raise.
+
     Raises:
-        RuntimeError: If both normal and force remove fail
+        RuntimeError: If removal fails.
     """
-    project_name = project_dir.name
     branch_slug = branch.replace("/", "-")
-    worktree_path = worktree_base / f"{project_name}-{branch_slug}"
+    # Locate the real registered path first (git registry is authoritative).
+    # Fall back to the branch-derived dir when the branch is not registered.
+    worktree_path = _find_worktree_path_by_branch(project_dir, branch)
+    if worktree_path is None:
+        # Worktree directory = branch (branch already contains the project prefix)
+        worktree_path = worktree_base / branch_slug
 
-    if worktree_path.exists():
-        # Try normal remove
-        result = subprocess.run(
-            ["git", "worktree", "remove", str(worktree_path)],
-            cwd=str(project_dir),
-            capture_output=True,
-            text=True,
-        )
+    remove_worktree_path(project_dir, worktree_path)
 
-        if result.returncode != 0:
-            # Force remove on failure
-            result = subprocess.run(
-                ["git", "worktree", "remove", str(worktree_path), "--force"],
-                cwd=str(project_dir),
-                capture_output=True,
-                text=True,
-            )
-            if result.returncode != 0:
-                stderr_text = result.stderr.strip()
-                raise RuntimeError(
-                    f"Failed to remove worktree {worktree_path}: {stderr_text}\n"
-                    f"Diagnostic hints:\n"
-                    f"  - Common causes: a process is holding the directory open, "
-                    f"or large untracked files (node_modules, dist, out) are present\n"
-                    f"  - Check for processes: lsof +D {worktree_path}\n"
-                    f"  - Manually remove: trash {worktree_path}"
-                )
-
-    # Always prune (whether remove succeeded or path didn't exist)
-    subprocess.run(
-        ["git", "worktree", "prune"],
+    # Always prune (whether remove succeeded or path didn't exist).
+    # `git worktree prune` can exit 0 while printing a deletion error to
+    # stderr (e.g. Permission denied), so both are inspected; a failure is
+    # reported and returned, never silently ignored (B-04).
+    warnings: list[str] = []
+    prune_cmd = ["git", "worktree", "prune"]
+    prune = subprocess.run(
+        prune_cmd,
         cwd=str(project_dir),
         capture_output=True,
         text=True,
     )
+    if prune.returncode != 0:
+        failure = GitMutationFailure.from_completed(
+            prune_cmd, str(project_dir), prune,
+        )
+        log_warn(f"git worktree prune failed:\n{failure}")
+        warnings.append(f"git worktree prune failed:\n{failure}")
+    elif prune.stderr.strip():
+        log_warn(f"git worktree prune reported errors: {prune.stderr.strip()}")
+        warnings.append(
+            f"git worktree prune reported errors: {prune.stderr.strip()}"
+        )
+    return warnings
 
 
-def delete_branch(git_dir: Path, branch: str) -> bool:
+@dataclass
+class BranchDeleteResult:
+    """Outcome of delete_branch, distinguishing the four real states.
+
+    status:
+        "deleted" — the local ref was deleted (soft or forced)
+        "absent"  — the local ref does not exist (nothing to do)
+        "skipped" — the branch is currently checked out (cannot delete)
+        "failed"  — both `git branch -d` and `-D` failed; attempts carry
+                    the full mutation diagnostics
+    """
+
+    status: str
+    attempts: list[GitMutationFailure] = field(default_factory=list)
+
+    @property
+    def deleted(self) -> bool:
+        return self.status == "deleted"
+
+    @property
+    def incomplete(self) -> bool:
+        """True when a real deletion failure left the ref behind."""
+        return self.status == "failed"
+
+
+def delete_branch(git_dir: Path, branch: str) -> BranchDeleteResult:
     """Delete a local branch (git branch -d, then -D on failure).
 
-    Skips if branch is the current branch.
+    Distinguishes "absent" (nothing to delete) and "skipped" (the branch
+    is currently checked out) from a real "failed" deletion; failures keep
+    the exact git diagnostics instead of collapsing into a bare False.
 
     Args:
         git_dir: Path to git repository root
         branch: Branch name to delete
 
     Returns:
-        True if branch was deleted, False if skipped or failed
+        BranchDeleteResult with status and, on failure, both attempts'
+        diagnostics.
     """
     # Check current branch — skip if it's the branch to delete
     result = subprocess.run(
@@ -578,28 +638,61 @@ def delete_branch(git_dir: Path, branch: str) -> bool:
     )
     current = result.stdout.strip()
     if current == branch:
-        return False
+        return BranchDeleteResult("skipped")
+
+    # No ref → nothing to delete. Distinguish "ref does not exist" (exit 1,
+    # empty stderr under --quiet) from "rev-parse itself failed" (permission,
+    # corruption — non-empty stderr). The latter must not be reported as
+    # absent (W-02): that would let cleanup succeed on an unknown state.
+    exists = subprocess.run(
+        ["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+        cwd=str(git_dir),
+        capture_output=True,
+        text=True,
+    )
+    if exists.returncode != 0:
+        if exists.stderr.strip():
+            return BranchDeleteResult(
+                "failed",
+                attempts=[GitMutationFailure(
+                    command=["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}"],
+                    cwd=str(git_dir),
+                    exit_code=exists.returncode,
+                    stdout=exists.stdout,
+                    stderr=exists.stderr,
+                )],
+            )
+        return BranchDeleteResult("absent")
 
     # Try soft delete (-d)
+    d_cmd = ["git", "branch", "-d", branch]
     result = subprocess.run(
-        ["git", "branch", "-d", branch],
+        d_cmd,
         cwd=str(git_dir),
         capture_output=True,
         text=True,
     )
-
     if result.returncode == 0:
-        return True
+        return BranchDeleteResult("deleted")
 
     # Force delete (-D) on failure
-    result = subprocess.run(
-        ["git", "branch", "-D", branch],
+    D_cmd = ["git", "branch", "-D", branch]
+    force_result = subprocess.run(
+        D_cmd,
         cwd=str(git_dir),
         capture_output=True,
         text=True,
     )
+    if force_result.returncode == 0:
+        return BranchDeleteResult("deleted")
 
-    return result.returncode == 0
+    return BranchDeleteResult(
+        "failed",
+        attempts=[
+            GitMutationFailure.from_completed(d_cmd, str(git_dir), result),
+            GitMutationFailure.from_completed(D_cmd, str(git_dir), force_result),
+        ],
+    )
 
 
 def clean_worktree(project_dir: Path, branch: str, worktree_base: Path) -> dict:
@@ -614,30 +707,52 @@ def clean_worktree(project_dir: Path, branch: str, worktree_base: Path) -> dict:
         worktree_base: Base directory where worktrees are stored
 
     Returns:
-        {"removed": bool, "branch_deleted": bool, "errors": list[str]}
+        {"removed": bool, "branch_deleted": bool, "branch_status": str,
+         "errors": list[str]}
+        branch_status is the BranchDeleteResult status: deleted / absent /
+        skipped / failed.
     """
     errors = []
 
     # 1. Remove worktree
     removed = False
     try:
-        remove_worktree(project_dir, branch, worktree_base)
+        warnings = remove_worktree(project_dir, branch, worktree_base)
         removed = True
+        if warnings:
+            errors.extend(warnings)
     except Exception as e:
         errors.append(f"Failed to remove worktree: {e}")
 
-    # 2. Delete branch
+    # A failed removal means the worktree may still contain the only copy
+    # of local work. Never continue to delete its branch.
+    if not removed:
+        return {
+            "removed": False,
+            "branch_deleted": False,
+            "branch_status": "skipped",
+            "errors": errors,
+        }
+
+    # 2. Delete branch — a real failure keeps both attempts' diagnostics
+    #    so callers can report the incomplete cleanup truthfully.
     branch_deleted = False
+    branch_status = "failed"
     try:
-        branch_deleted = delete_branch(project_dir, branch)
-        if not branch_deleted:
-            # Branch might not exist or is current — not an error
-            pass
+        branch_result = delete_branch(project_dir, branch)
+        branch_status = branch_result.status
+        branch_deleted = branch_result.deleted
+        if branch_result.incomplete:
+            detail = "\n".join(str(a) for a in branch_result.attempts)
+            errors.append(
+                f"Failed to delete branch '{branch}':\n{detail}"
+            )
     except Exception as e:
         errors.append(f"Failed to delete branch: {e}")
 
     return {
         "removed": removed,
         "branch_deleted": branch_deleted,
+        "branch_status": branch_status,
         "errors": errors,
     }

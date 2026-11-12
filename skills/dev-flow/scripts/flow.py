@@ -1,8 +1,4 @@
-"""Flow CLI — Python entry point for dev-flow.
-
-Phase 0 skeleton: only provides --help and version; all subcommands
-will be dispatched here in later phases by switching the hybrid router.
-"""
+"""Flow CLI — Python entry point for dev-flow."""
 
 from __future__ import annotations
 
@@ -18,9 +14,8 @@ from commands.approve import register_approve_parser, cmd_approve
 from commands.submit import register_submit_parser, cmd_submit
 from commands.complete import register_complete_parser, cmd_complete
 from commands.verify import register_verify_parser, cmd_verify
+from commands.integrate import register_integrate_parser, cmd_integrate
 from commands.plan import register_plan_parser, cmd_plan
-from commands.decompose import register_decompose_parser, cmd_decompose
-from commands.roadmap import register_roadmap_parser, cmd_roadmap
 from commands.reset import register_reset_parser, cmd_reset
 from commands.verify_switch import run_verify_switch
 
@@ -61,14 +56,11 @@ def build_parser() -> argparse.ArgumentParser:
     # Register verify subcommand
     register_verify_parser(subparsers)
 
+    # Register formal Delivery integration
+    register_integrate_parser(subparsers)
+
     # Register plan subcommand
     register_plan_parser(subparsers)
-
-    # Register decompose-prd subcommand (top-level alias)
-    register_decompose_parser(subparsers)
-
-    # Register roadmap subcommand
-    register_roadmap_parser(subparsers)
 
     # Register reset subcommand
     register_reset_parser(subparsers)
@@ -90,28 +82,31 @@ def main(argv: list[str] | None = None) -> int:
         print()
         print("Available subcommands:")
         print("  issue create    Create a new GitHub Issue")
-        print("  issue update    Update an existing GitHub Issue")
-        print("  sync            Sync Plan to Issue (body + labels)")
-        print("  sync --body-only    Sync only Issue body")
-        print("  sync --labels-only  Sync only Issue labels")
+        print("  issue edit      Edit an existing Issue (title/type/project labels/body)")
+        print("  issue merge     Merge duplicate Issues into one primary Issue")
+        print("  issue close     Close an Issue")
+        print("  issue delete    Delete an Issue")
+        print("  issue list      List open Issues in the space repo (with repo URL)")
+        print("  issue view      View a single Issue by number")
+        print("  sync            Sync Plan to Issue (three sections + | Plan | link row + labels)")
+        print("  sync --body-only    Sync only the Issue body (three sections + | Plan | link row)")
+        print("  sync --labels-only  Sync Issue labels only (body untouched)")
         print("")
         print("Workflow commands:")
         print("  plan new <issue>              Create a new Plan from Issue")
-        print("  plan new --title ...         Create a new Plan without Issue")
+        print("  plan new --project ...       Create a normal Plan without Issue")
         print("  plan status <plan-id>        Show Plan status details")
         print("  plan list [--issue]          List active Plans")
         print("  plan check <name-or-path>    Validate Plan against quality gates")
         print("  submit                       Submit Plan for review (planning -> reviewing)")
         print("  approve                      Approve a reviewed Plan (--confirm required)")
         print("  complete                     Mark implementation complete")
+        print("  integrate                    Integrate a validated Delivery")
         print("  verify                       Verify and confirm completion")
         print("  verify-switch                Switch workspace for worktree verification")
         print("  archive                      Archive a completed Plan")
         print("")
         print("Utility commands:")
-        print("  decompose-prd   Create Issues from PRD phases")
-        print("  decompose       Create Issues from PRD or ROADMAP.md slices")
-        print("  roadmap         Product phase roadmap (Analyze/Discuss/Produce/Decompose)")
         print("  reset           Reset Plan to planning status")
         print("")
         print("For detailed options: flow.sh <command> --help")
@@ -145,17 +140,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "verify":
         return cmd_verify(args)
 
+    if args.command == "integrate":
+        return cmd_integrate(args)
+
     # Dispatch plan subcommand
     if args.command == "plan":
         return cmd_plan(args)
-
-    # Dispatch decompose-prd / decompose subcommand
-    if args.command in ("decompose-prd", "decompose"):
-        return cmd_decompose(args)
-
-    # Dispatch roadmap subcommand
-    if args.command == "roadmap":
-        return cmd_roadmap(args)
 
     # Dispatch reset subcommand
     if args.command == "reset":

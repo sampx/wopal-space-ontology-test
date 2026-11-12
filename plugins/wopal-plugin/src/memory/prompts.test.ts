@@ -9,28 +9,49 @@ describe("createMemoryPrompts", () => {
   const roots: string[] = [];
 
   afterEach(() => {
-    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+    for (const root of roots.splice(0))
+      rmSync(root, { recursive: true, force: true });
   });
 
-  it("binds prompt resolution to the invocation context", () => {
+  it("uses the user-level prompt file when the plugin ships no override", () => {
     const root = join(tmpdir(), `wopal-prompts-${crypto.randomUUID()}`);
     const home = join(root, "home");
-    const spaceA = join(root, "a");
-    const spaceB = join(root, "b");
+    const space = join(root, "space");
     roots.push(root);
-    for (const directory of [join(home, "prompts"), join(spaceA, ".wopal", "prompts"), join(spaceB, ".wopal", "prompts")]) {
-      mkdirSync(directory, { recursive: true });
-    }
-    writeFileSync(join(home, "prompts", "title.md"), "home");
-    writeFileSync(join(spaceA, ".wopal", "prompts", "title.md"), "space-a");
-    writeFileSync(join(spaceB, ".wopal", "prompts", "title.md"), "space-b");
+    mkdirSync(join(space, ".wopal"), { recursive: true });
+    mkdirSync(join(home, "prompts"), { recursive: true });
+    // The plugin ships `dedup.md`, so use a filename it does not provide.
+    writeFileSync(join(home, "prompts", "dedup-custom.md"), "home-dedup");
 
-    const promptsA = createMemoryPrompts(createRuntimeContext({ directory: spaceA, wopalHome: home, wopalSpaceRoot: spaceA }), {});
-    const promptsB = createMemoryPrompts(createRuntimeContext({ directory: spaceB, wopalHome: home, wopalSpaceRoot: spaceB }), {});
-    const promptsGlobal = createMemoryPrompts(createRuntimeContext({ directory: root, wopalHome: home }), {});
+    const context = createRuntimeContext({
+      directory: space,
+      wopalHome: home,
+      wopalSpaceRoot: space,
+    });
 
-    expect(promptsA.loadTitlePrompt()).toBe("space-a");
-    expect(promptsB.loadTitlePrompt()).toBe("space-b");
-    expect(promptsGlobal.loadTitlePrompt()).toBe("home");
+    expect(context.pluginRoot).toBeTruthy();
+    expect(createMemoryPrompts(context).resolvePromptFile("dedup-custom.md")).toBe(
+      join(home, "prompts", "dedup-custom.md"),
+    );
+  });
+
+  it("prefers the plugin-shipped prompt over the user-level file", () => {
+    const root = join(tmpdir(), `wopal-prompts-${crypto.randomUUID()}`);
+    const home = join(root, "home");
+    const space = join(root, "space");
+    roots.push(root);
+    mkdirSync(join(space, ".wopal"), { recursive: true });
+    mkdirSync(join(home, "prompts"), { recursive: true });
+    writeFileSync(join(home, "prompts", "dedup.md"), "home-dedup");
+
+    const context = createRuntimeContext({
+      directory: space,
+      wopalHome: home,
+      wopalSpaceRoot: space,
+    });
+
+    expect(createMemoryPrompts(context).resolvePromptFile("dedup.md")).toBe(
+      join(context.pluginRoot, "prompts", "dedup.md"),
+    );
   });
 });

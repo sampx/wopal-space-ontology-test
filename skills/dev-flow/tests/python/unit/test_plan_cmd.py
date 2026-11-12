@@ -27,14 +27,15 @@ ensure_scripts_path()
 
 from commands.plan import (
     get_plan_metadata,
-    _extract_slug,
     _get_status_display_list,
     _scan_local_plans,
     _cmd_plan_list,
     _cmd_plan_list_local_only,
     _cmd_plan_list_with_issue,
     _cmd_plan_status,
+    _cmd_plan_new,
     _derive_project_path,
+    create_plan_from_template,
     cmd_plan,
     register_plan_parser,
 )
@@ -92,19 +93,6 @@ class TestGetPlanMetadata(unittest.TestCase):
     def test_returns_empty_dict_for_missing_file(self):
         metadata = get_plan_metadata(str(Path(self.tmp_dir) / "nonexistent.md"))
         self.assertEqual(metadata, {})
-
-
-class TestExtractSlug(unittest.TestCase):
-    """Test _extract_slug."""
-
-    def test_issue_prefixed_name(self):
-        self.assertEqual(_extract_slug("42-fix-task-wait-bug"), "task-wait-bug")
-
-    def test_no_issue_prefix(self):
-        self.assertEqual(_extract_slug("refactor-optimize-files"), "optimize-files")
-
-    def test_type_prefix_only(self):
-        self.assertEqual(_extract_slug("feature-add-auth"), "add-auth")
 
 
 class TestGetStatusDisplayList(unittest.TestCase):
@@ -274,6 +262,64 @@ class TestCmdPlanStatus(unittest.TestCase):
                 result = _cmd_plan_status("999")
                 self.assertEqual(result, 1)
 
+    def test_status_fallback_uses_branch_as_worktree_dir(self):
+        """B-01: fallback worktree path = .worktrees/<project>-<plan-name>.
+
+        Worktree dir directly equals branch (no ontology- prefix, no repeated
+        project prefix)."""
+        import io
+        from contextlib import redirect_stdout
+
+        ws = Path(self.tmp_dir)
+        # Plan: 42-fix-cli-bug, project wopal-cli -> branch wopal-cli-42-fix-cli-bug
+        wt_dir = ws / ".worktrees" / "wopal-cli-42-fix-cli-bug"
+        wt_dir.mkdir(parents=True)
+
+        with patch('commands.plan.find_workspace_root', return_value=ws):
+            with patch('commands.plan.find_plan', return_value=str(self.plan_file)):
+                with patch('plan.get_plan_worktree', return_value=None):
+                    with patch('commands.plan.subprocess.run') as mock_run:
+                        mock_run.return_value = MagicMock(stdout="wopal-cli-42-fix-cli-bug\n")
+                        buf = io.StringIO()
+                        with redirect_stdout(buf):
+                            result = _cmd_plan_status("42")
+                        self.assertEqual(result, 0)
+                        output = buf.getvalue()
+                        self.assertIn("Worktree:", output)
+                        self.assertIn(str(wt_dir), output)
+                        # Must NOT use old ontology- prefix or repeated project prefix
+                        self.assertNotIn("ontology-wopal-cli-42-fix-cli-bug", output)
+                        self.assertNotIn("wopal-cli-wopal-cli-42-fix-cli-bug", output)
+
+    def test_status_fallback_for_no_issue_plan(self):
+        """B-01: no-Issue plan fallback also derives worktree from full plan name."""
+        import io
+        from contextlib import redirect_stdout
+
+        ws = Path(self.tmp_dir)
+        # no-Issue plan: refactor-cli-optimize-commands, project wopal-cli
+        no_issue_plan = ws / "plans" / "refactor-cli-optimize-commands.md"
+        no_issue_plan.parent.mkdir(parents=True, exist_ok=True)
+        no_issue_plan.write_text(
+            "# refactor-cli-optimize-commands\n\n## Metadata\n\n"
+            "- **Type**: refactor\n- **Target Project**: wopal-cli\n"
+            "- **Created**: 2026-05-02\n- **Status**: executing\n"
+        )
+        wt_dir = ws / ".worktrees" / "wopal-cli-refactor-cli-optimize-commands"
+        wt_dir.mkdir(parents=True)
+
+        with patch('commands.plan.find_workspace_root', return_value=ws):
+            with patch('commands.plan.find_plan', return_value=str(no_issue_plan)):
+                with patch('plan.get_plan_worktree', return_value=None):
+                    with patch('commands.plan.subprocess.run') as mock_run:
+                        mock_run.return_value = MagicMock(stdout="wopal-cli-refactor-cli-optimize-commands\n")
+                        buf = io.StringIO()
+                        with redirect_stdout(buf):
+                            result = _cmd_plan_status("refactor-cli-optimize-commands")
+                        self.assertEqual(result, 0)
+                        output = buf.getvalue()
+                        self.assertIn(str(wt_dir), output)
+
 
 class TestCmdPlanDispatch(unittest.TestCase):
     """Test cmd_plan subcommand dispatch (new subparser structure)."""
@@ -305,14 +351,32 @@ class TestCmdPlanDispatch(unittest.TestCase):
                 self.assertEqual(result, 0)
                 mock_list.assert_called_once()
 
+    def test_plan_new_refuses_to_create_when_issue_matches_multiple_plans(self):
+        """Ambiguity must not silently fall through to creating another Plan."""
+        ws = Path(self.tmp_dir)
+        args = Namespace(
+            plan_command="new",
+            issue="249",
+            title=None, project=None, type="enhance", slug="resolver",
+        )
+        from lib.project import AmbiguousPlanError
+        with patch('commands.plan.find_workspace_root', return_value=ws), \
+             patch('commands.plan.detect_space_repo', return_value="owner/repo"), \
+             patch('commands.plan.find_plan_by_issue',
+                   side_effect=AmbiguousPlanError("Ambiguous plan for: 249")) as resolver, \
+             patch('commands.plan._get_issue_info') as fetch_issue:
+            result = cmd_plan(args)
+        assert result == 1
+        resolver.assert_called_once()
+        fetch_issue.assert_not_called()
+
     def test_plan_new_falls_through_to_creation(self):
         """plan new 42 falls through to creation logic."""
         ws = Path(self.tmp_dir)
         args = Namespace(
             plan_command="new",
             issue="42",
-            title=None, project=None, type=None,
-            scope=None,
+            title=None, project=None, type=None, slug=None,
         )
         with patch('commands.plan.find_workspace_root', return_value=ws):
             # Will fail trying to detect_space_repo, but proves dispatch works
@@ -333,8 +397,7 @@ class TestCmdPlanDispatch(unittest.TestCase):
         args = Namespace(
             plan_command="new",
             issue=None,
-            title=None, project=None, type=None,
-            scope=None,
+            title=None, project=None, type=None, slug=None,
         )
         with patch('commands.plan.find_workspace_root', return_value=ws):
             result = cmd_plan(args)
@@ -408,6 +471,215 @@ class TestCmdPlanCheck(unittest.TestCase):
                 self.assertEqual(result, 1)
 
 
+class TestCmdPlanNewIssueMode(unittest.TestCase):
+    """Test _cmd_plan_new Issue mode requires explicit --type and --slug.
+
+    Issue title is free-form; type and slug must be explicitly specified by
+    Wopal via --type and --slug. They are no longer derived from the Issue
+    title, and there is no scope segment in the Plan name.
+    """
+
+    def setUp(self):
+        self.tmp_dir = tempfile.mkdtemp()
+        wopal_git = Path(self.tmp_dir) / ".wopal" / ".git"
+        wopal_git.parent.mkdir(parents=True)
+        wopal_git.write_text("gitdir: /some/path")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp_dir)
+
+    def _make_args(self, **overrides):
+        base = {
+            "plan_command": "new",
+            "issue": "42",
+            "title": None,
+            "project": "wopal-cli",
+            "type": "feature",
+            "slug": "add-skills-remove-command",
+        }
+        base.update(overrides)
+        return Namespace(**base)
+
+    def test_issue_mode_requires_slug(self):
+        """Issue mode: missing --slug errors."""
+        ws = Path(self.tmp_dir)
+        args = self._make_args(slug=None)
+        with patch('commands.plan.find_workspace_root', return_value=ws):
+            with patch('commands.plan.log_error') as mock_log_error:
+                result = _cmd_plan_new(args)
+                self.assertEqual(result, 1)
+                error_calls = [str(c) for c in mock_log_error.call_args_list]
+                self.assertTrue(
+                    any('slug' in c.lower() for c in error_calls),
+                    f"Error should mention slug: {error_calls}",
+                )
+
+    def test_issue_mode_requires_type(self):
+        """Issue mode: missing --type errors."""
+        ws = Path(self.tmp_dir)
+        args = self._make_args(type=None)
+        with patch('commands.plan.find_workspace_root', return_value=ws):
+            with patch('commands.plan.log_error') as mock_log_error:
+                result = _cmd_plan_new(args)
+                self.assertEqual(result, 1)
+                error_calls = [str(c) for c in mock_log_error.call_args_list]
+                self.assertTrue(
+                    any('type' in c.lower() for c in error_calls),
+                    f"Error should mention type: {error_calls}",
+                )
+
+    def test_issue_mode_uses_explicit_slug(self):
+        """Issue mode: plan name uses explicit --slug, not derived from title."""
+        ws = Path(self.tmp_dir)
+        args = self._make_args(slug="explicit-slug")
+        issue_info = {
+            "title": "add skills remove command",  # free-form, no type/scope
+            "body": "",
+            "number": 42,
+            "state": "open",
+            "labels": [{"name": "project/wopal-cli"}],
+        }
+        with patch('commands.plan.find_workspace_root', return_value=ws):
+            with patch('commands.plan.detect_space_repo', return_value='test/repo'):
+                with patch('commands.plan._get_issue_info', return_value=issue_info):
+                    with patch('commands.plan._resolve_plan_dir', return_value=Path(self.tmp_dir) / "plans"):
+                        with patch('commands.plan.create_plan_from_template') as mock_create:
+                            mock_create.return_value = Path(self.tmp_dir) / "plans" / "42-feature-explicit-slug.md"
+                            result = _cmd_plan_new(args)
+                            self.assertEqual(result, 0)
+                            # Plan name carries issue, type and the explicit slug
+                            call_kwargs = mock_create.call_args
+                            self.assertEqual(call_kwargs[0][0], "42-feature-explicit-slug")
+
+    def test_issue_mode_without_project_rejects_issue_with_no_project_labels(self):
+        ws = Path(self.tmp_dir)
+        args = self._make_args(project=None, slug="project-select")
+        issue_info = {
+            "title": "add skills remove command",
+            "body": "",
+            "number": 42,
+            "state": "open",
+            "labels": [],
+        }
+        with patch('commands.plan.find_workspace_root', return_value=ws):
+            with patch('commands.plan.detect_space_repo', return_value='test/repo'):
+                with patch('commands.plan.find_plan_by_issue', side_effect=FileNotFoundError):
+                    with patch('commands.plan._get_issue_info', return_value=issue_info):
+                        with patch('commands.plan.create_plan_from_template') as create:
+                            result = _cmd_plan_new(args)
+
+        self.assertEqual(result, 1)
+        create.assert_not_called()
+
+    def test_issue_mode_without_project_rejects_issue_with_multiple_project_labels(self):
+        ws = Path(self.tmp_dir)
+        args = self._make_args(project=None, slug="project-select")
+        issue_info = {
+            "title": "add skills remove command",
+            "body": "",
+            "number": 42,
+            "state": "open",
+            "labels": [
+                {"name": "project/wopal-cli"},
+                {"name": "project/wopal-site"},
+            ],
+        }
+        with patch('commands.plan.find_workspace_root', return_value=ws):
+            with patch('commands.plan.detect_space_repo', return_value='test/repo'):
+                with patch('commands.plan.find_plan_by_issue', side_effect=FileNotFoundError):
+                    with patch('commands.plan._get_issue_info', return_value=issue_info):
+                        with patch('commands.plan.create_plan_from_template') as create:
+                            result = _cmd_plan_new(args)
+
+        self.assertEqual(result, 1)
+        create.assert_not_called()
+
+    def test_issue_mode_auto_selects_the_only_project_label(self):
+        ws = Path(self.tmp_dir)
+        args = self._make_args(project=None, slug="project-select")
+        issue_info = {
+            "title": "add skills remove command",
+            "body": "",
+            "number": 42,
+            "state": "open",
+            "labels": [{"name": "project/wopal-cli"}],
+        }
+        with patch('commands.plan.find_workspace_root', return_value=ws):
+            with patch('commands.plan.detect_space_repo', return_value='test/repo'):
+                with patch('commands.plan.find_plan_by_issue', side_effect=FileNotFoundError):
+                    with patch('commands.plan._get_issue_info', return_value=issue_info):
+                        with patch('commands.plan._resolve_plan_dir', return_value=Path(self.tmp_dir) / "plans"):
+                            with patch('commands.plan.create_plan_from_template') as create:
+                                create.return_value = Path(self.tmp_dir) / "plans" / "42-feature-add-skills-remove-command.md"
+                                with patch('commands.plan.ensure_label_exists'):
+                                    with patch('commands.plan.sync_status_label_group'):
+                                        with patch('commands.plan.sync_project_label_group'):
+                                            result = _cmd_plan_new(args)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(create.call_args.args[4], "wopal-cli")
+
+    def test_explicit_project_is_added_to_issue_without_replacing_other_projects(self):
+        ws = Path(self.tmp_dir)
+        args = self._make_args(project="wopal-cli", slug="project-select")
+        issue_info = {
+            "title": "add skills remove command",
+            "body": "",
+            "number": 42,
+            "state": "open",
+            "labels": [{"name": "project/wopal-site"}],
+        }
+        with patch('commands.plan.find_workspace_root', return_value=ws):
+            with patch('commands.plan.detect_space_repo', return_value='test/repo'):
+                with patch('commands.plan.find_plan_by_issue', side_effect=FileNotFoundError):
+                    with patch('commands.plan._get_issue_info', return_value=issue_info):
+                        with patch('commands.plan._resolve_plan_dir', return_value=Path(self.tmp_dir) / "plans"):
+                            with patch('commands.plan.create_plan_from_template') as create:
+                                create.return_value = Path(self.tmp_dir) / "plans" / "42-feature-add-skills-remove-command.md"
+                                with patch('commands.plan.ensure_label_exists') as ensure:
+                                    with patch('commands.plan.sync_status_label_group'):
+                                        with patch('commands.plan.sync_project_label_group') as sync_project:
+                                            result = _cmd_plan_new(args)
+
+        self.assertEqual(result, 0)
+        ensure.assert_any_call("project/wopal-cli", "test/repo")
+        sync_project.assert_called_once_with(42, "project/wopal-cli", "test/repo")
+
+
+class TestCreatePlanFromTemplate(unittest.TestCase):
+    def test_generated_plan_strips_html_comments(self):
+        root = Path(tempfile.mkdtemp())
+        try:
+            template = root / ".wopal" / "skills" / "dev-flow" / "templates" / "plan.md"
+            template.parent.mkdir(parents=True)
+            template.write_text(
+                "# {plan_name}\n\n"
+                "<!-- author-only guidance -->\n\n"
+                "## Metadata\n\n"
+                "- **Issue**: {issue}\n"
+                "- **Type**: {type}\n"
+                "- **Target Project**: {project}\n"
+                "- **Product**: {product}\n"
+                "- **Phase**: {phase}\n"
+                "- **Project Path**: {path}\n"
+                "- **Created**: {date}\n"
+                "- **Status**: planning\n"
+            )
+            plan = create_plan_from_template(
+                "42-feature-clean-plan",
+                root / "plans",
+                42,
+                "feature",
+                "demo",
+                root,
+            )
+            generated = plan.read_text()
+            self.assertNotIn("<!--", generated)
+            self.assertNotIn("author-only guidance", generated)
+        finally:
+            shutil.rmtree(root)
+
+
 class TestDeriveProjectPath(unittest.TestCase):
     """Test _derive_project_path auto-fill logic."""
 
@@ -424,7 +696,7 @@ class TestDeriveProjectPath(unittest.TestCase):
         )
 
     def test_declared_overrides_project(self):
-        """ontology-worktree declares '.wopal', must not be overridden."""
+        """A declared Project Path must not be overridden by the derived one."""
         self.assertEqual(_derive_project_path("wopal-cli", ".wopal"), ".wopal")
 
     def test_empty_when_nothing_known(self):

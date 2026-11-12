@@ -5,10 +5,9 @@
 #   Metadata: get_plan_field, get_plan_project, get_plan_project_path,
 #             get_plan_type, get_plan_issue, get_plan_status,
 #             set_plan_field, get_plan_worktree, set_plan_worktree
-#   Project:  resolve_project_type, resolve_project_info, resolve_project_repo,
-#             resolve_project_path, ProjectType
+#   Project:  resolve_project_repo, resolve_project_path
 #   Naming:   validate_plan_name, make_plan_name
-#   Body:     build_issue_body_from_plan, build_plan_link_for_issue
+#   Body:     build_plan_link_for_issue
 #   Find:     find_plan, find_plan_by_name, find_plan_by_issue
 #   Link:     update_issue_plan_link
 
@@ -17,15 +16,15 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-import glob
-from enum import Enum
 from pathlib import Path
 
-from lib.workspace import find_workspace_root, get_ontology_main_repo
+from lib.workspace import find_workspace_root
 from lib.logging import log_info, log_success, log_error, log_warn, log_step
 from lib.git import get_current_branch
-from lib.project import resolve_plan_location, build_plan_blob_url
+from lib.project import build_plan_blob_url, get_default_branch, get_repo_slug, resolve_plan_location
 from lib import project as _project_resolver
+from labels import normalize_plan_type
+from issue import replace_plan_row_in_body
 
 
 # ============================================
@@ -43,39 +42,13 @@ def get_plan_field(plan_path: str, field_name: str) -> str:
     
     content = path.read_text()
     
-    pattern = rf'^\- \*\*{re.escape(field_name)}\*\*:\s*(.+)$'
+    pattern = rf'^\- \*\*{re.escape(field_name)}\*\*:[ \t]*(.+)$'
     match = re.search(pattern, content, re.MULTILINE)
     
     if match:
         return match.group(1).strip()
     
     return ""
-
-
-def parse_metadata(plan_path: str) -> dict:
-    """Parse all metadata fields from a Plan file into a dict.
-
-    Args:
-        plan_path: Path to Plan markdown file
-
-    Returns:
-        Dict with all metadata fields (Status, Type, Target Project, etc.)
-    """
-    path = Path(plan_path)
-    if not path.exists():
-        return {}
-
-    content = path.read_text()
-
-    metadata = {}
-    for match in re.finditer(r'^\- \*\*([^*]+)\*\*:\s*(.+)$', content, re.MULTILINE):
-        key = match.group(1).strip()
-        value = match.group(2).strip()
-        metadata[key] = value
-
-    return metadata
-
-
 def get_plan_project(plan_path: str) -> str:
     """Extract Target Project from Plan metadata."""
     return get_plan_field(plan_path, "Target Project")
@@ -92,13 +65,13 @@ def get_plan_type(plan_path: str) -> str:
 
 
 def get_plan_issue(plan_path: str) -> int | None:
-    """Extract Issue number from Plan metadata."""
+    """Extract the Plan's single Issue number, or None when absent/invalid."""
     issue_field = get_plan_field(plan_path, "Issue")
     
     if not issue_field:
         return None
     
-    match = re.search(r'#?(\d+)', issue_field)
+    match = re.fullmatch(r'\s*#?(\d+)\s*', issue_field)
     if match:
         return int(match.group(1))
     
@@ -118,14 +91,14 @@ def set_plan_field(plan_path: str, field_name: str, field_value: str) -> bool:
     
     content = path.read_text()
     
-    pattern = rf'^\- \*\*{re.escape(field_name)}\*\*:\s*.*$'
+    pattern = rf'^\- \*\*{re.escape(field_name)}\*\*:[ \t]*.*$'
     match = re.search(pattern, content, re.MULTILINE)
     
     if match:
         new_line = f'- **{field_name}**: {field_value}'
         new_content = re.sub(pattern, new_line, content, count=1, flags=re.MULTILINE)
     else:
-        status_pattern = r'^\- \*\*Status\*\*:\s*.*$'
+        status_pattern = r'^\- \*\*Status\*\*:[ \t]*.*$'
         status_match = re.search(status_pattern, content, re.MULTILINE)
         
         if status_match:
@@ -141,36 +114,14 @@ def set_plan_field(plan_path: str, field_name: str, field_value: str) -> bool:
 def get_plan_worktree(plan_path: str) -> dict | None:
     """Extract Worktree metadata from Plan file.
 
-    Supports:
-      1. New 2-field structured: - **Worktree**: with branch + path sub-fields
-      2. Old 9-field structured: - **Worktree**: with enabled, project_type, etc.
-      3. Legacy pipe format: - **Worktree**: branch | path
+    Supports the structured formats: - **Worktree**: with branch + path
+    sub-fields (new 2-field and old 9-field).
 
     Returns:
         {'branch': str, 'path': str} if found, None otherwise
     """
-    # Try structured format (new 2-field and old 9-field) first
     from lib.worktree import parse_worktree_meta
-    meta = parse_worktree_meta(plan_path)
-    if meta is not None:
-        return meta
-
-    # Fallback to legacy pipe format
-    raw = get_plan_field(plan_path, "Worktree")
-    if not raw:
-        return None
-
-    parts = raw.split('|', 1)
-    if len(parts) != 2:
-        return None
-
-    branch = parts[0].strip()
-    path = parts[1].strip()
-
-    if not branch or not path:
-        return None
-
-    return {'branch': branch, 'path': path}
+    return parse_worktree_meta(plan_path)
 
 
 def set_plan_worktree(plan_path: str, branch: str, path: str) -> bool:
@@ -183,108 +134,22 @@ def set_plan_worktree(plan_path: str, branch: str, path: str) -> bool:
 # Project (from project.py)
 # ============================================
 
-class ProjectType(Enum):
-    """Project type enumeration."""
-    STANDARD = "standard"
-    ONTOLOGY_WORKTREE = "ontology-worktree"
-
-
-def _parse_github_repo_url(url: str) -> str | None:
-    """Parse GitHub remote URL to owner/repo format."""
-    match = re.search(r'github\.com[/:]([^/]+/[^/]+?)(?:\.git)?$', url)
-    if match:
-        return match.group(1)
-    return None
-
-
-def _get_wopal_repo_name(workspace_root: Path) -> str | None:
-    """Get the GitHub repo short name from .wopal's origin remote."""
-    dot_git = workspace_root / ".wopal" / ".git"
-    if not dot_git.exists() or not dot_git.is_file():
-        return None
-
-    try:
-        result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=workspace_root / ".wopal",
-            capture_output=True, text=True, check=True,
-        )
-        repo = _parse_github_repo_url(result.stdout.strip())
-        if repo:
-            return repo.split("/")[-1]
-    except subprocess.CalledProcessError:
-        pass
-
-    return None
-
-
-def resolve_project_type(project_name: str, workspace_root: Path | None = None) -> ProjectType:
-    """Resolve project type from workspace structure."""
-    if workspace_root:
-        repo_name = _get_wopal_repo_name(workspace_root)
-        if repo_name and repo_name == project_name:
-            return ProjectType.ONTOLOGY_WORKTREE
-    return ProjectType.STANDARD
-
-
-def resolve_project_info(project_name: str, workspace_root: Path) -> tuple[ProjectType, str | None]:
-    """Resolve project type and workspace-relative path."""
-    repo_name = _get_wopal_repo_name(workspace_root)
-    if repo_name and repo_name == project_name:
-        return ProjectType.ONTOLOGY_WORKTREE, ".wopal"
-    return ProjectType.STANDARD, None
-
-
-def _get_default_branch(project_path: Path) -> str:
-    """Detect the remote default branch for a git repository."""
-    # 1. Query remote HEAD
-    try:
-        result = subprocess.run(
-            ["git", "ls-remote", "--symref", "origin", "HEAD"],
-            cwd=project_path,
-            capture_output=True, text=True, check=True,
-        )
-        first_line = result.stdout.strip().split("\n")[0]
-        if first_line.startswith("ref: refs/heads/"):
-            return first_line.split("/")[-1].split("\t")[0]
-    except subprocess.CalledProcessError:
-        pass
-
-    # 2. Fall back to local cache
-    try:
-        result = subprocess.run(
-            ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
-            cwd=project_path,
-            capture_output=True, text=True, check=True,
-        )
-        return result.stdout.strip().split("/")[-1]
-    except subprocess.CalledProcessError:
-        pass
-
-    return "main"
-
-
 def resolve_project_repo(project_path: Path) -> tuple[str | None, str]:
-    """Dynamically resolve GitHub repo and base branch from project path."""
+    """Resolve the GitHub repo slug and base branch for a project path.
+
+    Branch resolution is local-only, delegating to lib.project: a network
+    round-trip here used to hang under a sandbox.
+    """
     if not project_path.exists():
         return None, "main"
 
-    repo = None
-    try:
-        result = subprocess.run(
-            ["git", "remote", "get-url", "origin"],
-            cwd=project_path,
-            capture_output=True, text=True, check=True,
-        )
-        repo = _parse_github_repo_url(result.stdout.strip())
-    except subprocess.CalledProcessError:
-        pass
+    repo = get_repo_slug(project_path)
 
     dot_git = project_path / ".git"
     if dot_git.exists() and dot_git.is_file():
         base_branch = get_current_branch(project_path) or "main"
     else:
-        base_branch = _get_default_branch(project_path)
+        base_branch = get_default_branch(project_path)
 
     return repo, base_branch
 
@@ -309,7 +174,7 @@ def resolve_project_path(
         if git_root:
             return git_root
 
-    # Step 2: Backward compat fallback
+    # Step 2: Fallback to projects/<project_name>
     if project_name:
         candidate = workspace_root / "projects" / project_name
         git_root = _find_git_root(candidate)
@@ -340,11 +205,6 @@ def _find_git_root(path: Path) -> Path | None:
     return None
 
 
-def _is_git_repo(project_path: Path) -> bool:
-    """Check if path is inside a git repository."""
-    return _find_git_root(project_path) is not None
-
-
 # ============================================
 # Naming (from naming.py)
 # ============================================
@@ -354,161 +214,79 @@ class ValidationError(Exception):
     pass
 
 
-# Valid types for plan name
-_PLAN_VALID_TYPES = ['feature', 'enhance', 'fix', 'refactor', 'docs', 'chore', 'test']
+_SLUG_MAX_LENGTH = 20
+
+# Type segment, spelled out — the same vocabulary labels.normalize_plan_type owns.
+# Non-capturing: the only groups this pattern exposes are (issue) and (slug).
+_TYPE_PATTERN = r'(?:feature|enhance|fix|perf|refactor|docs|chore|test)'
+# ASCII kebab-case only. `\w` would also match CJK, so name the character class
+# explicitly instead of relying on regex word semantics.
+_SLUG_PATTERN = r'[a-z0-9]+(?:-[a-z0-9]+)*'
+
+_PLAN_NAME_PATTERN = re.compile(rf'^(?:([0-9]+)-)?{_TYPE_PATTERN}-({_SLUG_PATTERN})$')
 
 
-def validate_plan_name(name: str) -> None:
-    """Validate Plan naming convention.
-    
-    Naming: <issue_number>-<type>-<scope>-<slug>.md OR <type>-<scope>-<slug>.md (no Issue)
+def validate_plan_name(name: str, *, enforce_slug_length: bool = True) -> None:
+    """Validate a Plan name.
+
+    Naming: `<issue>-<type>-<slug>` (Issue-driven) or `<type>-<slug>` (no Issue).
+    There is no scope segment: `--project` already names the area, and the slug
+    carries the subject.
+
+    The name is checked because it is used verbatim to derive the feature
+    branch: a non-ASCII or over-long name would produce a branch name that some
+    tooling cannot handle. `enforce_slug_length=False` is for Plans that already
+    exist — their branch is already derived, so renaming would break the working
+    copy; the length cap only governs new names.
     """
-    pattern = r'^([0-9]+)?-?(feature|enhance|fix|refactor|docs|chore|test)-([a-z0-9]+)-([a-z0-9-]+)$'
-    
-    if not re.match(pattern, name):
+    match = _PLAN_NAME_PATTERN.match(name)
+    if not match:
         raise ValidationError(
             f"Invalid plan name: {name}\n"
             "\n"
-            "Plan naming convention (scope is mandatory):\n"
-            "  <issue_number>-<type>-<scope>-<slug>.md  (with Issue)\n"
-            "  <type>-<scope>-<slug>.md                 (no Issue)\n"
+            "Plan naming convention:\n"
+            "  <issue>-<type>-<slug>   (with Issue)\n"
+            "  <type>-<slug>           (no Issue)\n"
             "\n"
-            "Types: feature, enhance, fix, refactor, docs, chore, test\n"
-            "Scope: short lowercase identifier (e.g., cli, dev-flow, plugin)\n"
-            "Slug: short lowercase with hyphens\n"
+            "Types: feature, enhance, fix, perf, refactor, docs, chore, test\n"
+            "Slug: English kebab-case (a-z, 0-9, '-')\n"
+            "No scope segment: the project already names the area.\n"
+            "Give the slug with --slug, e.g. --slug pr-102 -> fix-pr-102\n"
+        )
+
+    slug = match.group(2)
+    if enforce_slug_length and len(slug) > _SLUG_MAX_LENGTH:
+        raise ValidationError(
+            f"Slug too long: {len(slug)} chars (max {_SLUG_MAX_LENGTH}): '{slug}'. "
+            "Pass a shorter --slug: keep 1-2 core nouns, drop verb phrases "
+            "(see references/plan-guide.md 'Slug rules')."
         )
 
 
 def make_plan_name(
     issue_number: int | None,
     plan_type: str,
-    scope: str,
-    slug: str
+    slug: str,
 ) -> str:
-    """Generate plan name from components."""
-    normalized_type = _normalize_type(plan_type)
-    
-    if issue_number:
-        return f"{issue_number}-{normalized_type}-{scope}-{slug}"
-    else:
-        return f"{normalized_type}-{scope}-{slug}"
+    """Generate a Plan name from its components.
 
-
-def _normalize_type(raw_type: str) -> str:
-    """Normalize plan type to canonical value."""
-    raw = raw_type.lower()
-    
-    if raw in ('feat', 'feature'):
-        return 'feature'
-    elif raw in ('enhance', 'enhancement'):
-        return 'enhance'
-    elif raw in ('fix', 'bug'):
-        return 'fix'
-    elif raw in ('perf', 'performance'):
-        return 'perf'
-    elif raw == 'refactor':
-        return 'refactor'
-    elif raw in ('docs', 'doc', 'documentation'):
-        return 'docs'
-    elif raw in ('chore', 'ci'):
-        return 'chore'
-    elif raw == 'test':
-        return 'test'
-    else:
-        raise ValidationError(f"Invalid plan type: {raw_type}")
+    Naming: `<issue>-<type>-<slug>` (Issue-driven) or `<type>-<slug>` (no Issue).
+    Type is normalized via labels.normalize_plan_type (single source of truth);
+    the finished name goes through validate_plan_name, so a non-kebab-case or
+    over-long slug is rejected with the fix named — never silently truncated.
+    """
+    normalized_type = normalize_plan_type(plan_type)
+    name = (
+        f"{issue_number}-{normalized_type}-{slug}" if issue_number
+        else f"{normalized_type}-{slug}"
+    )
+    validate_plan_name(name)
+    return name
 
 
 # ============================================
 # Body (from body.py)
 # ============================================
-
-def _extract_plan_section(plan_file: str, section: str, limit: int = 0) -> str:
-    """Extract a markdown section body from a plan file.
-    
-    Handles fenced code blocks — only matches ## headings outside code blocks.
-    """
-    content = []
-    in_code = False
-    found = False
-    count = 0
-    
-    with open(plan_file, 'r') as f:
-        for line in f:
-            if line.strip().startswith('```'):
-                in_code = not in_code
-                continue
-            
-            if not in_code and line.strip() == f"## {section}":
-                found = True
-                continue
-            
-            if found and not in_code and line.startswith("##") and not line.startswith(f"## {section}"):
-                break
-            
-            if found and not in_code:
-                content.append(line)
-                count += 1
-                if limit > 0 and count >= limit:
-                    break
-    
-    return ''.join(content).strip()
-
-
-def _extract_subsection(plan_file: str, subsection: str) -> str:
-    """Extract a named subsection from a section."""
-    content = []
-    in_subsection = False
-    
-    with open(plan_file, 'r') as f:
-        for line in f:
-            if line.strip() == f"### {subsection}":
-                in_subsection = True
-                continue
-            
-            if in_subsection and (line.startswith("###") or (line.startswith("##") and not line.startswith("###"))):
-                break
-            
-            if in_subsection:
-                content.append(line)
-    
-    return ''.join(content).strip()
-
-
-def _extract_acceptance_criteria(plan_file: str) -> str:
-    """Extract Acceptance Criteria section (including Agent/User sub-sections).
-    
-    Converts numbered checkboxes (1. [ ]) to GitHub-compatible format (- [ ]).
-    """
-    content = []
-    in_section = False
-    
-    with open(plan_file, 'r') as f:
-        for line in f:
-            if line.strip() == "## Acceptance Criteria":
-                in_section = True
-                continue
-            
-            if in_section and line.startswith("## ") and not line.startswith("## Acceptance Criteria"):
-                break
-            
-            if in_section:
-                content.append(line)
-    
-    raw_content = ''.join(content).strip()
-    
-    converted = re.sub(r'^(\s*)(\d+)\.\s+\[\s*\]', r'\1- [ ]', raw_content, flags=re.MULTILINE)
-    converted = re.sub(r'^(\s*)(\d+)\.\s+\[x\]', r'\1- [x]', converted, flags=re.MULTILINE)
-    
-    return converted
-
-
-def _render_issue_section(heading: str, content: str, placeholder: str = "") -> str:
-    """Render a markdown section with heading."""
-    if not content:
-        content = placeholder
-    
-    return f"## {heading}\n\n{content}\n"
-
 
 def build_plan_link_for_issue(plan_file: str, plan_name: str, repo: str, workspace_root: str = None) -> str:
     """Build Plan link row for Issue's Related Resources table.
@@ -535,11 +313,6 @@ def build_plan_link_for_issue(plan_file: str, plan_name: str, repo: str, workspa
     return f"| Plan | [{plan_name}]({github_url}) |"
 
 
-def build_issue_body_from_plan(plan_file: str, plan_name: str, repo: str, workspace_root: str = None) -> str:
-    """Build Plan link for Issue body (delegates to build_plan_link_for_issue)."""
-    return build_plan_link_for_issue(plan_file, plan_name, repo, workspace_root)
-
-
 # ============================================
 # Find (from find.py)
 # ============================================
@@ -548,7 +321,6 @@ def find_plan(input_ref: str, workspace_root: str | Path | None = None) -> str:
     """Smart plan lookup: find plan by Issue number OR plan name.
 
     Delegates to lib.project.find_plan() for path resolution.
-    Returns the plan file path as a string for backward compatibility.
     """
     if workspace_root is None:
         workspace_root = find_workspace_root()
@@ -560,8 +332,7 @@ def find_plan(input_ref: str, workspace_root: str | Path | None = None) -> str:
 def find_plan_by_name(plan_name: str, workspace_root: str | Path = None) -> str:
     """Find plan file by plan name.
 
-    Delegates to lib.project.find_plan() which handles new paths
-    and DEPRECATED legacy read-only fallback.
+    Delegates to lib.project.find_plan() for path resolution.
     """
     if workspace_root is None:
         workspace_root = find_workspace_root()
@@ -573,8 +344,7 @@ def find_plan_by_name(plan_name: str, workspace_root: str | Path = None) -> str:
 def find_plan_by_issue(issue_number: int, workspace_root: str | Path = None) -> str:
     """Find plan file by issue number.
 
-    Delegates to lib.project.find_plan() which handles new paths
-    and DEPRECATED legacy read-only fallback.
+    Delegates to lib.project.find_plan() for path resolution.
     """
     if workspace_root is None:
         workspace_root = find_workspace_root()
@@ -587,29 +357,23 @@ def find_plan_by_issue(issue_number: int, workspace_root: str | Path = None) -> 
 # Link (from link.py)
 # ============================================
 
-def _build_relative_path(archived_file: str, workspace_root: Path) -> str:
-    """Build relative path from docs/."""
-    archived_path = Path(archived_file)
-    docs_root = workspace_root / 'docs'
-    
-    try:
-        relative = archived_path.relative_to(docs_root)
-        return str(relative)
-    except ValueError:
-        return archived_path.name
-
-
-def update_issue_plan_link(issue_number: int, plan_file: str, repo: str, workspace_root: str = None):
+def update_issue_plan_link(issue_number: int, plan_file: str, repo: str, workspace_root: str = None, branch: str | None = None):
     """Update Issue Plan link after archive.
     
     Uses resolve_plan_location() to determine the Plan's actual project repo,
-    so the blob URL points to the correct repo and branch.
+    so the blob URL points to the correct repo and branch. When `branch` is
+    given (the branch that actually carries the archive commit, verified by
+    push), it overrides resolve_plan_location's default branch — a plain
+    checkout may be on a non-default branch, and the link must point at the
+    ref that actually holds the archived content (B-02).
     
     Args:
         issue_number: Issue number to update
         plan_file: Path to the (archived) Plan file
         repo: Space repo (used for gh CLI --repo flag for Issue operations)
         workspace_root: Workspace root path
+        branch: Branch that actually carries the archive commit (B-02);
+            when given, overrides the resolved default branch in the URL
     """
     workspace = Path(workspace_root) if workspace_root else find_workspace_root()
     
@@ -621,7 +385,7 @@ def update_issue_plan_link(issue_number: int, plan_file: str, repo: str, workspa
 
     # Resolve Plan location to get correct repo + branch + relative path
     loc = resolve_plan_location(Path(plan_file), workspace)
-    blob_url = build_plan_blob_url(loc)
+    blob_url = build_plan_blob_url(loc, branch=branch)
     
     # Get current Issue body
     state_dir = workspace / 'state'
@@ -637,24 +401,16 @@ def update_issue_plan_link(issue_number: int, plan_file: str, repo: str, workspa
                 text=True,
                 check=True
             )
-            current_body = result.stdout
+            # `gh --jq` appends one trailing newline; strip exactly that one so
+            # the row rewrite preserves the body's real trailing bytes.
+            current_body = result.stdout[:-1] if result.stdout.endswith("\n") else result.stdout
         except (subprocess.CalledProcessError, FileNotFoundError):
             print("Warning: gh CLI not available, skipping Plan link update")
             return
     
-    # Update Plan link in Related Resources table
-    new_body = re.sub(
-        rf'\[{re.escape(plan_name)}\]\([^)]*\)',
-        f'[{plan_name}]({blob_url})',
-        current_body
-    )
-    
-    if new_body == current_body:
-        new_body = re.sub(
-            r'(\| Plan \| \[)[^]]+\]\([^)]*\)',
-            f'| Plan | [{plan_name}]({blob_url})',
-            current_body
-        )
+    # Update the Plan row through the single row-replacement primitive
+    new_body = replace_plan_row_in_body(
+        current_body, f"| Plan | [{plan_name}]({blob_url}) |")
     
     # Update Issue
     edit_args_file = state_dir / 'edit-args.txt'

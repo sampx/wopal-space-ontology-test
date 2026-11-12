@@ -1,447 +1,454 @@
-# Implementation Review Rubric
+# Implementation Review Rubric — Pattern Catalogues & Procedures
 
-审查方法论与问题模式参考。rook 只使用 `read` / `glob` / `grep` / `lsp` 等只读工具。
+Detail behind the four questions. Load this when a check needs its full method, a pattern catalogue, or a worked example.
 
-> 本源文件提炼自 WSF `verification-patterns.md` 的四层验证模型、存根模式与连接检测方法论。
-
----
-
-## 核心原则
-
-**存在 ≠ 实现**。文件存在不意味着功能有效。rook 必须逐层验证：
-
-1. **存在** — 预期路径下有文件
-2. **实质性** — 内容是真实实现，不是占位符
-3. **已连接** — 已接入系统其他部分（import → use → render）
-4. **功能性** — 调用时实际工作（通常需人工验证）
-
-1-3 层 rook 可独立完成。第 4 层标注为 `NEEDS_HUMAN`。
+Contents:
+1. [Building the three lists](#1-building-the-three-lists)
+2. [Q1 stub patterns & probes](#2-q1--stub-patterns--probes)
+3. [Q2 contract-surface procedure](#3-q2--contract-surface-procedure)
+4. [Q3 defect catalogue](#4-q3--defect-catalogue)
+5. [Q4 test integrity & documentation drift](#5-q4--test-integrity--documentation-drift)
+6. [Q4 orphan tags](#6-q4--orphan-tags-change-review-diff-created-orphans-only)
+7. [Probe bundle](#7-probe-bundle)
+8. [Capability standards gate (evolution proposals)](#8-capability-standards-gate-evolution-proposals)
+9. [Severity calibration](#9-severity-calibration)
+10. [Worked examples](#10-worked-examples)
 
 ---
 
-## 通用存根模式
+## 1. Building the three lists
 
-以下模式无论语言和文件类型，均表明占位符代码。
+Read the diff once (`git diff`, `git diff --cached`, `git show <hash>`, or `git diff <A>..<B>`) plus the changed files. Do not alternate between reading and probing — every return to a file costs more than the probe it saves. Fill three lists while reading:
 
-### 基于注释的存根
+1. **Claims** — every deliverable or acceptance criterion, sourced from Plan tasks, design clauses, `AGENTS.md` rules, or decisions recorded in the conversation. Collect these before judging anything.
+2. **Contract surface** — every exported symbol, signature, schema, shared type, or config the diff modifies, plus functions whose logic changed but signature didn't.
+3. **Flags** — possible stubs, wiring gaps, suspicious tests, orphans the diff may leave, to resolve in the sweeps.
 
+After this, all four questions consume the lists with targeted probes. Never re-scan what you already read.
+
+When no Plan, design clause, or recorded decision exists, say so in the report and limit the review to Q2 and Q3 real defects. Without a design basis you cannot judge Q1 completeness, and you have no standing to suggest improvements.
+
+## 2. Q1 — Stub patterns & probes
+
+A pattern's presence is a signal, not a verdict — classify by whether a claim or caller depends on real behavior.
+
+**Comment stubs**
 ```javascript
 // TODO: implement later
 // FIXME: this is broken
-// XXX: hack
 // HACK: temporary
 // PLACEHOLDER
-
-// ...
-/* ... */
-
-# ... (Python/Shell)
+// ... (empty body where logic belongs)
 ```
+Probe: `rg -n 'TODO|FIXME|XXX|HACK|PLACEHOLDER' <changed files>`
 
-rook 用 `grep` 工具检查，pattern: `(TODO|FIXME|XXX|HACK|PLACEHOLDER|\.\.\.)`
-
-### 占位符文本
-
+**Placeholder text**
 ```
-"placeholder"
-"lorem ipsum"
-"coming soon"
-"under construction"
-"TBD"
-"Not implemented"
+"placeholder"   "lorem ipsum"   "coming soon"   "under construction"
+"TBD"           "Not implemented"
 ```
+Probe: `rg -ni 'placeholder|lorem ipsum|coming soon|under construction|TBD|not implemented' <changed files>`
 
-rook 用 `grep` 工具检查，pattern: `(placeholder|lorem ipsum|coming soon|under construction|TBD|not implemented)`
-
-### 空实现
-
+**Empty implementations**
 ```javascript
-return null
-return undefined
-return {}
-return []
+return null   return undefined   return {}   return []
 ```
-
 ```python
-pass
-return None
-return {}
-return []
+pass   return None   return {}   return []
 ```
+Probe: `rg -n 'return null|return undefined|return \{\}|return \[\]|pass\s*$' <changed files>` — honest empty returns exist; classify by whether a caller or claim depends on real content.
 
-rook 用 `grep` 工具检查，pattern: `(return null|return undefined|return \{\}|return \[\])`
+**Log-only handlers** — a body that only logs or forwards has no behavior. Read each handler body.
 
-### 仅日志函数
-
-```javascript
-function handler(data) {
-  console.log(data)   // ← 仅日志，无实际逻辑
-}
-```
-
-### 假动态真硬编码
-
+**Fake-dynamic values**
 ```jsx
-// 应来自 state/props，实为硬编码
-<div>Message 1</div>
-<div>Message 2</div>
-
-// ID 应为动态生成
-const id = "fixed-id"
-
-// 计数应为计算结果
-const count = 3
-
-// 显示值应为格式化结果
-const price = "$9.99"
+<div>Message 1</div>        // should come from state/props
+const id = "fixed-id"       // should be generated
+const count = 3             // should be computed
 ```
+Classify against the claim: if the behavior must be dynamic and the value is fixed, BLOCKER.
 
----
-
-## 前端组件模式
-
-### 实质性检查
-
-以下均为存根，应被标记为 Blocker（若目标要求该组件有实际功能）：
-
+**Frontend shells**
 ```jsx
-// 空壳
 return <div>Component</div>
-return <div>Placeholder</div>
 return <p>Coming soon</p>
-return <div>{/* TODO */}</div>
-
-// 空返回
 return null
-return <></>
-
-// 空事件处理器
 onClick={() => {}}
-onChange={() => console.log('clicked')}
-onSubmit={(e) => e.preventDefault()}     // 仅阻止默认行为
+onSubmit={(e) => e.preventDefault()}
 ```
 
-**rook 检查方法**：
-1. `read` 组件文件，扫描 return 语句
-2. 检查 JSX 是否包含实质性元素（`className`, `onClick`, 动态表达式 `{...}`）
-3. 检查是否使用 props 或 state（`props.X`, `useState`, `{variable}`）
-
-### 连接检查：组件 → API
-
-组件渲染了，但数据从哪来？
-
-```jsx
-// ✅ 正确：组件调用 API 获取数据
-useEffect(() => {
-  fetch('/api/messages').then(r => r.json()).then(setMessages)
-}, [])
-
-// ❌ 问题：fetch 存在但响应未消费
-fetch('/api/messages')  // 无 await，无 .then，无赋值
-
-// ❌ 问题：fetch 被注释掉
-// fetch('/api/messages').then(r => r.json()).then(setMessages)
+**API route shells**
+```typescript
+export async function GET() { return Response.json([]) }   // static, no data source
+export async function POST() { return new Response() }     // empty body
 ```
 
-**rook 检查方法**：
-- 用 `grep` 工具在组件文件中搜索 `fetch\(|axios\.|useSWR|useQuery`
-- 用 `read` 确认调用是否被 await/消费/未被注释
-- 若组件需要数据但无 API 调用 → Warning
+**Database schema stubs** — model missing fields/relations the claimed behavior needs.
 
-### 连接检查：状态 → 渲染
-
-状态变量存在，但 JSX 里用了吗？
-
-```jsx
-// ❌ 状态存在但未渲染
-const [messages, setMessages] = useState([])
-return <div>No messages</div>    // 永远显示"无消息"
-
-// ❌ 渲染了错误的状态
-const [messages, setMessages] = useState([])
-return <div>{otherData.map(...)}</div>   // 用的是别的变量
+**Hook / utility stubs**
+```typescript
+export function useAuth() { return { user: null, login: () => {}, logout: () => {} } }
 ```
 
-**rook 检查方法**：用 `read` 比对 useState 变量名与 JSX `{...}` 中的引用。
+**Wiring checks for every new artifact:**
+- Declared → imported (`rg <symbol>`)
+- Imported → used (referenced, not merely present)
+- Used → reachable from an entry point (route, render tree, CLI, job runner)
+- Component → data source: fetch awaited, consumed, rendered
+- State → render: state variables actually appear in rendered output
+- API → storage: query awaited and its result returned, not discarded
+- Route → registration: new route/command/job registered where the framework discovers it
 
----
+## 3. Q2 — Contract-surface procedure
 
-## API 路由模式
+The mechanical gates miss this most. What slips through: silent behavior changes and untested-behavior breaks.
 
-### 实质性检查
+### Step 1 — extract the contract surface
 
-以下均为存根：
+From the diff, list every artifact other code can depend on:
+
+- exported functions/classes — signature, return type, thrown errors
+- data shapes — schema fields, JSON response structure, enum values, DB columns
+- shared types / constants / config keys
+- **functions whose logic changed but signature didn't** — the most dangerous class
+- test infrastructure — fixtures, mocks, helpers (their changes alter what existing tests prove)
+
+### Step 2 — find all consumers
+
+`rg <symbol>` across the project, including files outside the diff. For many consumers: `rg -l <symbol>`, read a representative sample, and state what you did not cover.
+
+### Step 3 — classify the break type
+
+| Break type | What to look for |
+|---|---|
+| Signature change | Added/removed params, narrowed/widened types, changed return type. Type systems catch most — but `any`, `as` casts, and dynamic languages do not |
+| Nullability change | Was `never null` (or empty), now `null`; or opposite. Callers indexing or chaining off the old guarantee break |
+| Sync → async | Now returns a Promise; callers awaiting nothing break silently in dynamic languages |
+| Ordering change | Array order, event order, iteration order that callers rely on |
+| Idempotency change | Retried calls now double-apply (or no longer do) |
+| Side-effect change | Pure function now writes global state; or side effect removed that callers depended on |
+| Error contract change | Different error codes, HTTP statuses, or error message format — callers often parse messages |
+| Default/behavior branch change | The path for a realistic input now returns different data than before |
+| Performance cliff | O(n) → O(n²) on a hot path is a break |
+| Schema drift | Field renamed/removed without migrating all readers; enum value removed |
+
+For each consumer, ask: which assumption from this table does it hold, and is it still true?
+
+### Severity
+
+- Diff-outside call site broken with a concrete scenario → **BLOCKER**
+- Behavior changed, but the design may have sanctioned it → check the design first; a sanctioned change is not a finding. Unsupported by any clause → `Info` at most
+- Consumers not fully checked → `UNCOVERED STEPS`, never fake coverage
+
+## 4. Q3 — Defect catalogue
+
+Walk the changed hunks against these patterns. Report only findings with a concrete scenario.
+
+**Concurrency & state**
+- race between async operations over shared state
+- non-atomic read-modify-write (check-then-act) on shared counters/flags
+- re-entrancy: handler re-entered before finishing (double submission)
+- partial update: multi-step mutation where step 2 can fail after step 1 committed, with no rollback
+- stale closure over loop variables or props
+
+**Resource lifecycle**
+- opened handle/connection/stream not closed on all paths
+- cleanup skipped on the error branch (the happy path closes, the catch doesn't)
+- pooled connections not returned (leak under load)
+- file/timer/subscription created per render or per call without teardown
+
+**Boundaries & numerics**
+- off-by-one in ranges, slices, pagination
+- empty collection / missing key / undefined before access
+- zero, negative, very large values flowing into division, allocation, indexing
+- overflow/size limits: sum, counter, buffer
+
+**Async**
+- missing `await` (fire-and-forget where the result matters)
+- floating promise: rejection never handled
+- ordering assumptions: responses arriving out of order overwrite newer state
+- timeout missing on external calls; caller hangs forever
+
+**Error handling**
+- swallowed exception, then continuing with invalid state
+- log-and-continue where the operation must abort
+- failure reported as success (HTTP 200 with an error payload the client can't see)
+- inconsistent state after partial failure; no compensation or rollback
+
+**Type/runtime seams**
+- `as`/unsafe cast over data the code did not validate
+- parsed input trusted as typed without a validation step
+- nullability assumed from a key that can legitimately be absent
+- JSON.parse / environment / query param treated as typed
+
+**Security**
+- user input reaching SQL, shell, or templates unparameterized
+- `innerHTML` / `dangerouslySetInnerHTML` with anything user-influenced
+- unsafe deserialization (`eval`, unpickling untrusted payloads)
+- request body used before validation; validation present but bypassable
+- new route/handler missing the auth check its siblings have
+- secrets in code, committed files, logs, or error messages
+
+Probes: `rg -n 'eval\(|dangerouslySetInnerHTML|innerHTML|exec\(|spawn\(' <changed files>`; check every new POST/PUT handler for validation before use; check new routes for auth middleware.
+
+## 5. Q4 — Test integrity & documentation drift
+
+### Test integrity — broken patterns
+
+| Pattern | Probe | Verdict |
+|---|---|---|
+| Skipped/disabled tests | `rg -n 'it\.skip|xdescribe|xit|@pytest\.mark\.skip|t\.Skip' <test files>` | BLOCKER for a behavior the design requires |
+| Circular proof | expected value generated by the code under test | BLOCKER |
+| Placeholder assertions | `rg -n 'expect\(true\)|expect\(false\)|expect\(1\)'` | BLOCKER |
+| Weak assertions (existence-only) | `rg -n 'toBeDefined|toBeTruthy|not\.toBeNull'` | all-weak file WARNING; one weak INFO |
+| No assertions | `rg -c 'expect\|assert' <file>` → zero | WARNING |
+| A behavior the design explicitly promises has no test | map the claims list to tests | WARNING |
+
+The bar: **would this test fail if the behavior broke?** A test that would still pass with the feature removed is decoration.
+
+Scope this to behaviors the design promises. An internal branch the design never mentions, in a shape you did not expect, is implementation freedom, not a coverage gap. Treating "every changed branch needs a test" as the standard turns the reviewer's imagination into requirements.
+
+### Documentation drift
+
+A change that alters an external contract without updating the docs that describe it ships with a lie. Reuse the Q2 contract surface; for each changed contract (API, schema, CLI flag, config key, behavior the design pins down):
+
+1. Find where it is documented — `rg '<symbol>' docs/ README* AGENTS.md` and public docstrings.
+2. Check whether the diff updated those spots.
+3. Docs that now contradict the **design** (not merely a code detail) → WARNING (REVISE: update docs). Docs that simply do not mention an implementation detail are fine.
+4. A project rule requiring docs to ship with code (stated in `AGENTS.md`) → violating it is BLOCKER, same as any stated constraint.
+
+Pure internal refactors with no contract change trigger nothing. Docs outside the repo you can see → `Needs Human`.
+
+## 6. Q4 — Orphan tags (change review: diff-created orphans only)
+
+A change review checks only the orphans and duplication **this diff** creates. Whole-repo slimming belongs to Repo audit mode.
+
+One line per finding: location, what to cut, what replaces it. **A finding without a replacement is a complaint, not a finding.**
+
+| Tag | Catches | Replacement |
+|---|---|---|
+| `delete:` | code, files, exports, or dependencies the diff orphaned by switching callers; dead code the diff introduced | nothing |
+| `shrink:` | duplication the diff introduced when an existing helper or a shorter form would do | name the existing helper or the shorter form |
+
+`stdlib:`, `native:`, and `yagni:` belong to Repo audit. Raising them in a change review means re-picking the implementer's technical choices — do not report them unless a design clause required that choice.
+
+### What to hunt (change review)
+
+- **orphans left behind by the diff**: for every `import` or function call removed in the diff, check (`rg <symbol-or-module>`) whether any production caller still references the old module or function. If production references drop to zero (or only its own test file imports it), flag `delete:` on both the orphaned production code and its orphaned test file.
+- dead code the diff itself wrote, commented-out blocks it left, exports it added with no caller
+
+Leave out of a change review (these are Repo audit work): pre-existing dead code, whole-repo unused dependencies, whether an existing implementation should use the standard library, whether existing interfaces are over-abstracted. None of them came from this diff, and raising them turns a small fix into a refactor.
+
+### Runtime & platform check for `stdlib:` and `native:` (Repo audit only)
+
+Before recommending a `stdlib:` or `native:` replacement, verify:
+1. **Runtime version**: check `engines` in `package.json`, `requires-python` in `pyproject.toml`, `go.mod`, or `rust-version` to confirm the builtin API exists in the project's minimum supported runtime.
+2. **Target OS**: if a `native:` replacement shells out to a system CLI (e.g., `zip`, `tar`, `sed`), confirm the tool and flags exist on every OS the project supports (macOS, Linux, Windows).
+
+### Never flag
+
+- the smallest check that would fail if the logic broke — a smoke test, one `assert`-based self-check, one small test file. That is the lean minimum, not bloat.
+- deliberate simplifications with valid `simplified:` comments that explicitly name their ceiling and upgrade path (flag only if missing an upgrade trigger).
+- input validation at trust boundaries, error handling that prevents data loss, security measures — never simplified away, never flagged for deletion.
+- tradeoffs the design explicitly accepted: polling instead of events, a fixed throttle window, sequential execution instead of concurrency, one retry instead of exponential backoff. These are decisions, not bloat.
+- taste ("I would have structured it differently"), naming, style preferences.
+
+### Severity
+
+| Condition | Severity |
+|---|---|
+| Diff switches callers away from old code/tests, leaving zero production references (orphan created by this diff) | **WARNING** (REVISE) |
+| Duplication this diff introduced where the repo already ships the logic, finding names `file:line` | **WARNING** (REVISE) |
+| Pre-existing dead code / unused dependency, stdlib/native replacement ideas, single-implementation interfaces (Repo audit mode) | INFO (dead code WARNING when it masks a claimed behavior) |
+| `shrink:` suggestions | INFO |
+
+Correctness first, then leanness — never trade one for the other. A lean finding must never conflict with Q1–Q3; when it does, correctness wins and the lean idea is dropped.
+
+### The metric (Repo audit only)
+
+End of report: `net: -N lines, -M dependencies possible` — sum the realistic cut across all findings. Nothing to cut → `Lean already. Ship.`
+
+A change review does not owe a line-count target. Hunting deletions during a change review is how a small fix becomes an unrequested refactor.
+
+## 7. Probe bundle
+
+### Diff review probes (Modes 1 & 2)
+
+Run these once, after reading the diff, against the changed files (fill in the paths):
+
+```bash
+FILES='<changed files>'
+rg -n 'TODO|FIXME|XXX|HACK|PLACEHOLDER' $FILES
+rg -ni 'placeholder|lorem ipsum|coming soon|under construction|TBD|not implemented' $FILES
+rg -n 'return null|return undefined|return \{\}|return \[\]|pass\s*$' $FILES
+rg -n 'console\.log|print\(' $FILES
+rg -n 'eval\(|dangerouslySetInnerHTML|innerHTML|exec\(|spawn\(' $FILES
+rg -n 'it\.skip|xdescribe|xit|describe\.skip|@pytest\.mark\.skip|t\.Skip' $FILES
+rg -n 'expect\(true\)|expect\(false\)|expect\(1\)' $FILES
+rg -n 'toBeDefined|toBeTruthy|toBeFalsy|not\.toBeNull' $FILES
+```
+
+- **Consumer check (Q2)**: for each exported symbol touched by the diff, run `rg -l '<symbol>' <project>` to find consumers, including outside the diff.
+- **Orphan check (Q4)**: for each `import` or helper call *removed* by the diff, run `rg -l '<old-module-or-symbol>' <project>` to verify whether the old target now has zero production callers (and whether its test file is now testing dead code).
+- **New-duplication check (Q4)**: `rg -n '<distinctive snippet from the new code>' <project>` to see whether an existing helper already does this. Report only duplication this diff introduced; abstract-class and factory scans belong to Repo audit.
+
+### Repo audit probes (Mode 3 — whole-repo or directory lean audit)
+
+When running in **Repo audit** mode (no diff; scanning an existing project or directory for bloat), run these static scans first so you don't miss unreferenced files or miscount dynamic imports:
+
+1. **Manifest & dependency usage**:
+   - Read `package.json` / `pyproject.toml` / `Cargo.toml` / `go.mod`.
+   - For each production dependency, count references across `src/` (`rg '<pkg>' src/`), checking static imports, dynamic `await import('<pkg>')`, and side-effect `import '<pkg>'`.
+   - Flag dependencies with 0 references as `delete:`, and single-call-site dependencies replaceable by stdlib as `stdlib:` / `native:`.
+2. **Orphaned files (0 production importers)**:
+   - List all non-entry source files under `src/` and check whether each file's stem is imported anywhere in `src/`.
+   - Files imported only by `tests/` (0 hits in `src/`) are dead production modules with orphaned test files — flag both with `delete:`.
+3. **Unused exports (0 external references)**:
+   - Scan exported symbols (`export function|const|class|type|interface`) across `src/`.
+   - Any exported symbol referenced only inside its own file (or only in `tests/`) is dead export surface — flag `delete:` (or drop `export` if used internally).
+4. **Single-implementation abstractions & wrappers**:
+   - Run `rg -n 'interface |abstract class |Factory|Manager|Adapter' src/` and inspect the largest files (`wc -l`).
+5. **Lingering debt markers, skipped tests & stale docs (when analyzing technical debt)**:
+   - Run `rg -n 'TODO|FIXME|XXX|HACK|PLACEHOLDER|simplified:' src/` and `rg -n 'it\.skip|xdescribe|xit|describe\.skip|@pytest\.mark\.skip|t\.Skip' tests/` to surface half-finished work and disabled tests alongside structural bloat. For `simplified:` comments, verify each names an upgrade trigger (flag any without a trigger as an unanchored shortcut risk).
+   - Group findings by impact in the report: **Dependencies to cut** → **Dead files & exports (`delete:`)** → **Stdlib / native replacements** → **Abstractions & duplication (`yagni:` / `shrink:`)** (plus **Debt markers & test/doc gaps** if present), ending with `net: -N lines, -M dependencies possible`.
+
+## 8. Capability standards gate (evolution proposals)
+
+When the prompt carries an evolution proposal path, the change lands capability assets. Check the landed files against the platform's own standards:
+
+| Standard | Check |
+|---|---|
+| frontmatter `name` + `description` | read the file header |
+| Triggering conditions in the description | the description states when to use it; the body does not bury trigger info in a late section |
+| Body = workflow + output + notes | no essays, no feature tours; long content offloaded to `references/` |
+| `scripts/` only deterministic, reusable logic | one-off snippets do not live in scripts/ |
+| No invented structure | asset anatomy matches the platform's other assets (no rogue subdirs, no novel file types) |
+| Plain, precise language | an agent knows what to do after one read; jargon and machine prose are findings |
+
+Severity: violates a stated standard → **WARNING** (REVISE); asset cannot work as landed (missing frontmatter, references to files that do not exist) → **BLOCKER**.
+
+This gate complements df-proposal-review, which checked the *stated* deliverable; this review checks the *landed* files.
+
+## 9. Severity calibration
+
+| Situation | Correct verdict |
+|---|---|
+| Handler logs the payload but the claim is "processes the message" | BLOCKER (Q1 stub) |
+| Function correctly written but no call site anywhere | WARNING (Q1 unwired) |
+| Diff changes a helper's return from `[]` to `null`; a diff-outside caller does `.map()` directly | BLOCKER (Q2) |
+| Endpoint now returns 200 with an error body where callers keyed on 4xx | WARNING/BLOCKER by severity (Q2) |
+| The only test of a claimed behavior is skipped | BLOCKER (Q4 test integrity) |
+| `expect(true).toBe(true)` | BLOCKER (Q4) |
+| A test checks `toBeDefined` plus two strong value assertions | no finding |
+| Four-line input normalization duplicated, rules stable | no finding |
+| Duplicated validation already diverged between two call sites | WARNING (Q4) |
+| Query executed, result discarded, static `{ ok: true }` returned | BLOCKER (Q1) |
+| Deletion of a helper that turns out to still be imported (build would catch) | no finding — CI owns build breakage |
+| Race between two async writes with a concrete interleaving | BLOCKER (Q3) |
+| Implementation works but violates a stated design constraint (module boundary, API contract written as "must") | BLOCKER (Q1 design conformance) |
+| Implementation matches a tradeoff the design explicitly accepted (fixed short cache window, sequential execution, polling) and violates no clause | no finding — the design decided |
+| Implementation chose a shape the reviewer dislikes, but the design neither requires nor forbids it | no finding (Info at most, and usually stays in your notes) |
+| Change alters an API the docs describe, docs untouched in the diff | WARNING (Q4 documentation drift) |
+| Two places in the same doc contradict each other about the design | WARNING (Q4 documentation drift) |
+| New `retry.ts` added by this diff duplicates `src/lib/http.ts:88` backoff already in use | WARNING (Q4 — duplication introduced by the diff) |
+| Diff switches command from `lib/doctor.ts` to `lib/inspect.ts`; `lib/doctor.ts` and `tests/lib/doctor.test.ts` now have zero production callers | WARNING (Q4 `delete:` orphan created by diff) |
+| `package.json` lists `eventsource`; `rg 'eventsource' src/` finds zero imports (pre-existing, untouched) | INFO in Repo audit only; not in a change review |
+| `AbstractStore` with a single `FileStore` implementation (pre-existing, untouched) | INFO in Repo audit only; not in a change review |
+| Landed skill buries triggering conditions in body section 4 | WARNING (capability gate) |
+| Landed skill's frontmatter lacks `description` | BLOCKER (capability gate) |
+| Design says unconfirmed quota exhaustion is transient rate limiting; implementation does that, but the reviewer thinks it should disable the account | `Design Feedback`, no verdict change |
+| Design never mentions an internal branch; implementation picked its own approach and left it untested | no finding — the design never promised that behavior |
+| Concern about visual appearance of a changed component | `Needs Human` |
+| "I would have structured this module differently" | no finding |
+
+Judgement note: any Blocker → BLOCK, else any Warning → REVISE, else PASS. Counting warnings is not the mechanism.
+
+## 10. Worked examples
+
+### Example A — Stub caught by Q1
+
+**Claim**: "Messages are fetched from the database". The route exists:
 
 ```typescript
-// 空响应
+// api/messages/route.ts:8
 export async function GET() {
-  return Response.json([])           // 空数组，无 DB 查询
-}
-
-export async function POST() {
-  return new Response()              // 空响应体
-}
-
-// 占位符消息
-export async function PUT() {
-  return Response.json({ message: "Not implemented" })
-}
-
-// 仅日志
-export async function POST(req) {
-  console.log(await req.json())
-  return Response.json({ ok: true }) // 无实际处理
+  return Response.json([])
 }
 ```
 
-### 连接检查：API → 数据库
+```yaml
+finding:
+  check: Q1_stub
+  severity: blocker
+  location: "api/messages/route.ts:8-10"
+  evidence: "handler returns a constant; no data source is consulted"
+  impact: "the endpoint cannot serve real data; the claim is false at the substantive level"
+  fix: "query the store and return its result, as the claim requires"
+```
 
-API 路由返回数据，但数据从哪来？
+### Example B — Silent behavior change caught by Q2
+
+**Diff**: a utility's empty-input return changed from `[]` to `null` to satisfy a new caller. No existing tests assert the empty case.
 
 ```typescript
-// ✅ 正确：查询数据库并返回结果
-export async function GET() {
-  const messages = await prisma.message.findMany()
-  return Response.json(messages)
-}
-
-// ❌ 查询了但未返回结果
-await prisma.message.findMany()
-return Response.json({ ok: true })   // 返回静态值，不是查询结果
-
-// ❌ 查询未 await（返回 Promise 不是数据）
-const messages = prisma.message.findMany()
-return Response.json(messages)       // 返回的是 Promise 对象
+// utils/filter.ts:12  (changed line)
+if (!list.length) return null          // was: return list
 ```
 
-**rook 检查方法**：
-- 用 `grep` 工具在路由文件中搜索 `prisma\.|db\.|query\(|findMany|create|update|delete`
-- 用 `read` 确认查询结果是否被 await 且被 return
+```yaml
+finding:
+  check: Q2_regression
+  severity: blocker
+  location: "utils/filter.ts:12"
+  evidence: "rg 'filter\(' src/ finds 14 call sites, 9 outside the diff; 3 call .map()/.length directly on the result"
+  impact: "any of those 3 call sites receiving an empty input now throws a TypeError at runtime, while the suite is green"
+  fix: "return an empty array for empty input and add a null-handling adapter at the one caller that wants null, or update all 14 call sites and audit their empty cases"
+```
 
-### 输入验证
+### Example C — Contract surface too large: honest scoping
 
-API 是否校验了输入？若 POST/PUT 路由直接使用 `req.json()` 不作任何校验 → Warning。
+A diff rewrites the shared `formatDate` used in 60 files. Reading all 60 is not review — it's a survey.
+
+**Correct handling**: extract the *contract* — signature, accepted inputs, output format, timezone behavior. Diff the contract against the old version. `rg -l` the consumers, read 3–5 representative call sites across categories (props rendering, API serialization, cache keys — anything that might hold a format assumption). Report the remainder under `UNCOVERED STEPS` or `Needs Human` with the reason.
+
+### Example D — Circular proof caught by Q4
 
 ```typescript
-// ✅ 有校验
-const body = schema.parse(await req.json())
-
-// ❌ 无校验
-const body = await req.json()
-// 直接使用 body.field...  未验证字段存在性/类型
-```
-
-**rook 检查方法**：用 `grep` 工具搜索 `schema\.parse|validate|zod|yup|joi`。
-
----
-
-## 数据库模式存根
-
-若变更包含数据库 schema 文件（`schema.prisma` / `schema.ts` / `*.sql`）：
-
-```prisma
-// ❌ 空壳模型
-model User {
-  id String @id
-  // TODO: add fields
-}
-
-// ❌ 仅 id + 一个字段
-model Message {
-  id      String @id
-  content String
-  // 缺少: createdAt, userId, chatId
-}
-
-// ❌ 缺少关键关系
-model Order {
-  id     String @id
-  // 缺少: userId, items (relation), total, status, createdAt
-}
-```
-
-**rook 检查方法**：`read` schema 文件，检查每个模型是否有 ≥ 3 个业务字段、相应关系是否定义。
-
----
-
-## 自定义 Hooks/工具存根
-
-```typescript
-// ❌ 空壳 hook
-export function useAuth() {
-  return { user: null, login: () => {}, logout: () => {} }
-}
-
-// ❌ 仅日志 hook
-export function useCart() {
-  const [items, setItems] = useState([])
-  return { items, addItem: () => console.log('add'), removeItem: () => {} }
-}
-
-// ❌ 硬编码返回
-export function useUser() {
-  return { name: "Test User", email: "test@example.com" }
-}
-```
-
-**rook 检查方法**：`read` hooks 文件，检查返回值和函数体是否有实质逻辑（调用 API、操作 state、副作用）。
-
----
-
-## 测试质量审计
-
-测试是目标达成的重要证据。不能只看测试是否存在，要审测试是否真的证明了什么。
-
-### 跳过/禁用的测试
-
-```typescript
-it.skip('sends message', () => { ... })
-it.skip('renders correctly')
-describe.skip('Chat', () => { ... })
-xit('loads data')
-xdescribe('Messages')
-```
-
-```python
-@pytest.mark.skip
-def test_send():
-    ...
-```
-
-```go
-t.Skip("not implemented")
-t.SkipNow()
-```
-
-**判定**：若某需求对应的测试全部被跳过/禁用 → Blocker。
-
-### 循环证明
-
-系统生成期望值，再用同一个系统验证——什么都没证明。
-
-```typescript
-// ❌ 循环证明
-const expected = generateOutput(input)   // 被测函数
-const actual = generateOutput(input)     // 同一函数
-expect(actual).toEqual(expected)          // 自己证明自己
-
-// ❌ 系统自己生成期望数据
-const expected = await system.createTestData()
-const actual = await system.getData()
+// tests/parser.test.ts:14-16
+const expected = parse(input)
+const actual = parse(input)
 expect(actual).toEqual(expected)
 ```
 
-**判定**：循环证明 → Blocker。
-
-### 占位断言
-
-永远通过的断言，无论实现如何变化都不会失败。
-
-```typescript
-expect(true).toBe(true)
-expect(false).toBe(false)
-expect(1).toBe(1)
-expect("test").toBe("test")
+```yaml
+finding:
+  check: Q4_test_integrity
+  severity: blocker
+  location: "tests/parser.test.ts:14-16"
+  evidence: "expected and actual both come from the parser under test"
+  impact: "the test cannot fail for the behavior it claims to protect; any output, correct or not, compares equal"
+  fix: "assert against independent expected values written by hand"
 ```
 
-**rook 检查方法**：用 `grep` 工具搜索 `expect\(true\)|expect\(false\)|expect\(1\)|expect\("test"\)`。
+### Example E — Duplication this diff introduced (reportable in a change review)
 
-**判定**：占位断言 → Blocker。
+**Diff**: this change adds `src/lib/slug.ts` (18 lines) hand-rolling slugification. `rg "kebabCase" src/` shows `package.json` already lists `lodash`, and two existing files already import `kebabCase`.
 
-### 弱断言（仅检查存在性）
-
-```typescript
-expect(result).toBeDefined()
-expect(component).toBeTruthy()
-expect(data).not.toBeNull()
-expect(response).toBeTruthy()
+```
+src/lib/slug.ts:L1-18: delete/shrink: 18 new lines duplicating lodash.kebabCase, already imported in 2 files. Replacement: delete the file, import kebabCase.
 ```
 
-只检查"东西存在"，不检查"值对不对"。以下为强断言对比：
+Reported as WARNING (duplication introduced by this change).
+
+Watch the boundary: only duplication **this diff wrote** counts. If two old files hand-rolled slugification while `lodash` sat in `package.json`, that is pre-existing debt — Repo audit territory, not a finding against this change.
+
+### Example F — Serious logic risk only when it contradicts the design
 
 ```typescript
-// ❌ 弱断言
-expect(result).toBeDefined()
-
-// ✅ 强断言
-expect(result).toEqual({ id: 1, name: 'test', email: 'test@example.com' })
-expect(result.id).toBe(1)
-expect(result.items).toHaveLength(3)
+// src/jobs/purge.ts:18
+await deleteAllUserContent(userId)
 ```
 
-**判定**：单个弱断言 → Info。若某测试文件中所有断言均为弱断言 → Warning。
+Report under `Serious Logic Risks (Discuss with User)` only when both hold: the effect is irreversible and severe, **and** it contradicts an explicit design clause (e.g., the design requires soft delete with a 7-day retention window).
 
-### 缺少断言
-
-测试文件存在，但内部没有任何 `expect` / `assert` 语句。
-
-**rook 检查方法**：用 `grep` 工具对测试文件搜索 `expect|assert`，命中数为 0 → 测试为空壳。
-
-**判定**：缺少断言 → Warning。
-
----
-
-## 审查清单
-
-rook 完成文件读取后，逐项回答以下问题：
-
-### 目标验证
-
-- [ ] 从 Plan 提取了目标（goal / must_haves.truths）
-- [ ] 每个目标对应的文件是否存在（Level 1）
-- [ ] 每个文件是否有实质实现，不是存根（Level 2）
-- [ ] 每个文件是否接入系统（import → use → render，Level 3）
-- [ ] 标注需要人工功能验证的项（Level 4）
-
-### 存根扫描
-
-- [ ] 检查 TODO/FIXME/PLACEHOLDER 注释
-- [ ] 检查 "coming soon" / "not implemented" 占位文本
-- [ ] 检查 `return null` / `return {}` / `return []` 空实现
-- [ ] 检查硬编码 ID/计数/显示值（假动态）
-- [ ] 检查空事件处理器（`onClick={() => {}}`）
-- [ ] 检查 API 返回占位符数据（空数组、静态消息）
-- [ ] 若涉及 schema，检查模型是否有空壳
-
-### 测试质量
-
-- [ ] 检查跳过的测试（`skip` / `xit` / `xdescribe`）
-- [ ] 检查循环证明（`expected = same_system(...)`）
-- [ ] 检查占位断言（`expect(true).toBe(true)`）
-- [ ] 检查弱断言（仅 `toBeDefined` / `toBeTruthy`）
-- [ ] 检查测试文件是否缺少断言
-
----
-
-## 判定参考
-
-| 情形 | 判定 |
-|------|------|
-| 目标对应的文件缺失 | Blocker |
-| 目标对应的文件是存根 | Blocker |
-| 安全漏洞（硬编码密钥、eval、XSS） | Blocker |
-| 测试全部跳过 / 循环证明 / 占位断言 | Blocker |
-| 文件未接入系统（存在但孤立） | Warning |
-| API 无输入校验 | Warning |
-| 测试全是弱断言 | Warning |
-| TODO/FIXME 标记（非关键路径） | Info |
-| 单个弱断言 | Info |
-| 硬编码 ID/文本（非目标要求动态的场景） | Info |
-
----
-
-## 人工验证指引
-
-以下情况 rook 应标注 `NEEDS_HUMAN`，而非自行判断：
-
-- 视觉外观是否正确
-- 用户流程是否完整可用
-- WebSocket / SSE 实时行为
-- 外部服务集成（Stripe、邮件）
-- 错误消息是否清晰有帮助
-- 移动端响应式
-- 无障碍性
-
----
-
-*本文件为 `df-implement-review` SKILL.md 的参考附件。rook 通过 `@references/review-rubric.md` 加载。*
+If the design calls for a hard delete, this is conformance, not risk. When the reviewer believes the design is wrong, that is one `Design Feedback` item — "hard delete is irreversible; consider soft delete with retention" — so the user changes the design first instead of blocking this delivery.
