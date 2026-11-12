@@ -1,0 +1,71 @@
+version: 1
+type: coding
+description: 全栈工程研发空间
+
+# 空间骨架。省略时按约定取 <type>-space-schema.yaml
+# schema: coding-space-schema.yaml
+
+# 声明该空间挂载的 Agent (装配进当前空间 worktree)
+# 四维核心角色跨类型常驻，不随类型变化
+agents:
+  - wopal.md
+  - fae.md
+  - rook.md
+  - maka.md
+
+# 声明该空间所需技能
+skills:
+  - space-master
+  - ontology-evolution
+  - agents-collab
+  - dev-flow
+  - df-proposal-review
+  - df-implement
+  - df-implement-review
+  - dev-doc-master
+  - git-worktrees
+  - skill-creator
+  - agent-browser
+  - context-manage
+  - codex-with-chatgpt
+  - colab-operator
+
+# 声明该空间加载的规则
+rules:
+  - testing.md
+  - typescript.md
+  - python.md
+  - git.md
+  - wopal/mem-rule.md
+
+# 声明该空间加载的命令
+commands:
+  - init.md
+  - commit.md
+  - review.md
+  - help.md
+  - cupdate-prd.md
+  - cupdate-design.md
+  - cupdate-roadmap.md
+  - cupdate-readme.md
+  - cupdate-agent-rules.md
+  - evaluate-skill.md
+  - cupdate-br.md
+  - context-continue.md
+  - context-handoff.md
+  - context-recover.md
+  - wopal/memo.md
+  - wopal/evolve.md
+  - wopal/distill.md
+  - wopal/memory.md
+  - wopal/summon.md
+  - wopal/ontology-maintain.md
+
+# 声明该空间加载的插件
+plugins:
+  ellamaka:
+    - wopal-plugin
+  tui:
+    - tui-ellamaka
+paths:
+  - dsh

@@ -2,7 +2,13 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import path from "path";
 import os from "os";
 import { mkdirSync, mkdtempSync, writeFileSync, rmSync } from "fs";
-import { resetSessionState, getSeedCount, upsertSessionState, getSessionStateSnapshot } from "../test-helpers.js"
+import {
+  resetSessionState,
+  getSeedCount,
+  upsertSessionState,
+  getSessionStateSnapshot,
+  enableRulesInjection,
+} from "../test-helpers.js";
 
 // Test directories - initialized in setupTestDirs
 let testDir: string;
@@ -25,39 +31,56 @@ function teardownTestDirs() {
   }
 }
 
-// Save and clear injection toggle env vars so tests aren't affected by external config
+// Isolate WOPAL_HOME so tests aren't affected by external config
 function saveAndClearInjectionEnv() {
   savedInjectionEnv = {
-    WOPAL_RULES_INJECTION_ENABLED: process.env.WOPAL_RULES_INJECTION_ENABLED,
-    WOPAL_MEMORY_INJECTION_ENABLED: process.env.WOPAL_MEMORY_INJECTION_ENABLED,
-    WOPAL_MEMORY_ENABLED: process.env.WOPAL_MEMORY_ENABLED,
     WOPAL_HOME: process.env.WOPAL_HOME,
   };
-  delete process.env.WOPAL_RULES_INJECTION_ENABLED;
-  delete process.env.WOPAL_MEMORY_INJECTION_ENABLED;
-  process.env.WOPAL_MEMORY_ENABLED = "false";
   process.env.WOPAL_HOME = path.join(testDir, ".wopal");
 }
 
 function restoreInjectionEnv() {
-  if (savedInjectionEnv.WOPAL_RULES_INJECTION_ENABLED !== undefined) {
-    process.env.WOPAL_RULES_INJECTION_ENABLED = savedInjectionEnv.WOPAL_RULES_INJECTION_ENABLED;
-  }
-  if (savedInjectionEnv.WOPAL_MEMORY_INJECTION_ENABLED !== undefined) {
-    process.env.WOPAL_MEMORY_INJECTION_ENABLED = savedInjectionEnv.WOPAL_MEMORY_INJECTION_ENABLED;
-  } else {
-    delete process.env.WOPAL_MEMORY_INJECTION_ENABLED;
-  }
-  if (savedInjectionEnv.WOPAL_MEMORY_ENABLED !== undefined) {
-    process.env.WOPAL_MEMORY_ENABLED = savedInjectionEnv.WOPAL_MEMORY_ENABLED;
-  } else {
-    delete process.env.WOPAL_MEMORY_ENABLED;
-  }
   if (savedInjectionEnv.WOPAL_HOME !== undefined) {
     process.env.WOPAL_HOME = savedInjectionEnv.WOPAL_HOME;
   } else {
     delete process.env.WOPAL_HOME;
   }
+}
+
+function withV2Api<T extends Record<string, unknown>>(client: T): T {
+  const internalFetch = vi.fn(async (input: unknown) => {
+    const raw =
+      typeof input === "string"
+        ? input
+        : input instanceof URL
+          ? input.toString()
+          : (input as { url: string }).url;
+    const url = new URL(raw);
+    if (url.pathname === "/skill") {
+      return new Response(JSON.stringify([]), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    }
+    const sessionMatch = url.pathname.match(/^\/session\/([^/]+)$/);
+    if (sessionMatch) {
+      return new Response(
+        JSON.stringify({
+          id: decodeURIComponent(sessionMatch[1]),
+          metadata: {},
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({}), {
+      status: 200,
+      headers: { "content-type": "application/json" },
+    });
+  });
+  return {
+    ...client,
+    _client: { getConfig: () => ({ fetch: internalFetch }) },
+  };
 }
 
 describe("OpenCodeRulesPlugin", () => {
@@ -75,7 +98,7 @@ describe("OpenCodeRulesPlugin", () => {
 
   it("should export a default plugin function", async () => {
     const { default: pluginDef } = await import("../index.js");
-      const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
+    const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     expect(typeof plugin).toBe("function");
   });
 
@@ -88,9 +111,9 @@ describe("OpenCodeRulesPlugin", () => {
     });
 
     const { default: pluginDef } = await import("../index.js");
-      const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
+    const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const mockInput = {
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: path.join(testDir, "empty-project"),
       worktree: testDir,
@@ -134,14 +157,15 @@ Do this always`,
     process.env.HOME = testDir;
 
     const { default: pluginDef } = await import("../index.js");
-      const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
+    const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const mockInput = {
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
       $: {} as any,
       serverUrl: new URL("http://localhost:3000"),
+      ...enableRulesInjection(),
     };
 
     try {
@@ -192,14 +216,15 @@ keywords:
     process.env.HOME = testDir;
 
     const { default: pluginDef } = await import("../index.js");
-      const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
+    const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const mockInput = {
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
       $: {} as any,
       serverUrl: new URL("http://localhost:3000"),
+      ...enableRulesInjection(),
     };
 
     try {
@@ -250,9 +275,9 @@ keywords:
     process.env.HOME = testDir;
 
     const { default: pluginDef } = await import("../index.js");
-      const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
+    const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const mockInput = {
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -290,11 +315,11 @@ keywords:
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
-      const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
+    const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -354,12 +379,13 @@ Use React best practices for components.`,
       const { default: pluginDef } = await import("../index.js");
       const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
       const mockInput = {
-        client: {} as any,
+        client: withV2Api({}) as any,
         project: {} as any,
         directory: testDir,
         worktree: testDir,
         $: {} as any,
         serverUrl: new URL("http://localhost:3000"),
+        ...enableRulesInjection(),
       };
 
       try {
@@ -414,7 +440,7 @@ Use React best practices for components.`,
       const { default: pluginDef } = await import("../index.js");
       const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
       const mockInput = {
-        client: {} as any,
+        client: withV2Api({}) as any,
         project: {} as any,
         directory: testDir,
         worktree: testDir,
@@ -478,7 +504,7 @@ Special rule content.`,
       const { default: pluginDef } = await import("../index.js");
       const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
       const mockInput = {
-        client: {} as any,
+        client: withV2Api({}) as any,
         project: {} as any,
         directory: testDir,
         worktree: testDir,
@@ -541,12 +567,13 @@ Follow testing best practices.`,
       const { default: pluginDef } = await import("../index.js");
       const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
       const mockInput = {
-        client: {} as any,
+        client: withV2Api({}) as any,
         project: {} as any,
         directory: testDir,
         worktree: testDir,
         $: {} as any,
         serverUrl: new URL("http://localhost:3000"),
+        ...enableRulesInjection(),
       };
 
       try {
@@ -601,7 +628,9 @@ Special rule content.`,
 
       const { default: pluginDef } = await import("../index.js");
       const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
-      const mockClient = { tool: { ids: vi.fn(async () => ({ data: [] })) } };
+      const mockClient = withV2Api({
+        tool: { ids: vi.fn(async () => ({ data: [] })) },
+      });
       const hooks = await plugin({
         client: mockClient as any,
         project: {} as any,
@@ -651,11 +680,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -670,18 +699,29 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "hello" }] },
-      { info: { role: "assistant", sessionID }, parts: [{ type: "text", text: "response" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "hello" }],
+      },
+      {
+        info: { role: "assistant", sessionID },
+        parts: [{ type: "text", text: "response" }],
+      },
     ];
 
     try {
       // Act
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
       const result = await messagesTransform({}, { messages });
 
       // Assert - last user message contains Skill Reload reminder as synthetic
       const lastUserMsg = result.messages[0];
-      const skillReloadPart = lastUserMsg.parts.find((p: any) => p.text?.includes("<system-reminder>") && p.text?.includes("dev-flow"));
+      const skillReloadPart = lastUserMsg.parts.find(
+        (p: any) =>
+          p.text?.includes("<system-reminder>") && p.text?.includes("dev-flow"),
+      );
       expect(skillReloadPart).toBeDefined();
       expect(skillReloadPart.type).toBe("text");
       expect(skillReloadPart.synthetic).toBe(true); // Must be synthetic (invisible to TUI)
@@ -695,11 +735,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -714,27 +754,39 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages1 = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "first" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "first" }],
+      },
     ];
 
     const messages2 = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "second" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "second" }],
+      },
     ];
 
     try {
       // Act - first call
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
       const result1 = await messagesTransform({}, { messages: messages1 });
 
       // Assert - Skill Reload injected
-      const skillReload1 = result1.messages[0].parts.find((p: any) => p.text?.includes("技能") && p.text?.includes("dev-flow"));
+      const skillReload1 = result1.messages[0].parts.find(
+        (p: any) => p.text?.includes("技能") && p.text?.includes("dev-flow"),
+      );
       expect(skillReload1).toBeDefined();
 
       // Act - second call
       const result2 = await messagesTransform({}, { messages: messages2 });
 
       // Assert - no Skill Reload (already consumed)
-      const skillReload2 = result2.messages[0].parts.find((p: any) => p.text?.includes("技能"));
+      const skillReload2 = result2.messages[0].parts.find((p: any) =>
+        p.text?.includes("技能"),
+      );
       expect(skillReload2).toBeUndefined();
     } finally {
       process.env.HOME = originalHome;
@@ -745,11 +797,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -764,16 +816,23 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "hello" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "hello" }],
+      },
     ];
 
     try {
       // Act
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
       const result = await messagesTransform({}, { messages });
 
       // Assert - no Skill Reload part
-      const skillReloadPart = result.messages[0].parts.find((p: any) => p.text?.includes("技能"));
+      const skillReloadPart = result.messages[0].parts.find((p: any) =>
+        p.text?.includes("技能"),
+      );
       expect(skillReloadPart).toBeUndefined();
     } finally {
       process.env.HOME = originalHome;
@@ -784,11 +843,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -803,12 +862,17 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages = [
-      { info: { role: "assistant", sessionID }, parts: [{ type: "text", text: "response" }] },
+      {
+        info: { role: "assistant", sessionID },
+        parts: [{ type: "text", text: "response" }],
+      },
     ];
 
     try {
       // Act
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
       const result = await messagesTransform({}, { messages });
 
       // Assert - no error, no synthetic part (no user message to inject into)
@@ -822,11 +886,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -841,17 +905,24 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "hello" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "hello" }],
+      },
     ];
 
     try {
       // Act
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
       const result = await messagesTransform({}, { messages });
 
       // Assert - transformedMessagesMap should contain the messages with Skill Reload
       // The map is internal to hooks, so we verify via result having Skill Reload part
-      expect(result.messages[0].parts.find((p: any) => p.text?.includes("技能"))).toBeDefined();
+      expect(
+        result.messages[0].parts.find((p: any) => p.text?.includes("技能")),
+      ).toBeDefined();
     } finally {
       process.env.HOME = originalHome;
     }
@@ -861,11 +932,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -881,16 +952,23 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "continue" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "continue" }],
+      },
     ];
 
     try {
       // Act
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
       const result = await messagesTransform({}, { messages });
 
       // Assert - Skill Reload injected despite seededFromHistory
-      const skillReloadPart = result.messages[0].parts.find((p: any) => p.text?.includes("技能") && p.text?.includes("dev-flow"));
+      const skillReloadPart = result.messages[0].parts.find(
+        (p: any) => p.text?.includes("技能") && p.text?.includes("dev-flow"),
+      );
       expect(skillReloadPart).toBeDefined();
     } finally {
       process.env.HOME = originalHome;
@@ -901,11 +979,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -921,11 +999,16 @@ describe("Skill Reload Migration", () => {
 
     // First call - no user message
     const messages1 = [
-      { info: { role: "assistant", sessionID }, parts: [{ type: "text", text: "response" }] },
+      {
+        info: { role: "assistant", sessionID },
+        parts: [{ type: "text", text: "response" }],
+      },
     ];
 
     try {
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
       await messagesTransform({}, { messages: messages1 });
 
       // Assert - needsSkillReload still true (not consumed)
@@ -934,13 +1017,18 @@ describe("Skill Reload Migration", () => {
 
       // Second call - with user message
       const messages2 = [
-        { info: { role: "user", sessionID }, parts: [{ type: "text", text: "hello" }] },
+        {
+          info: { role: "user", sessionID },
+          parts: [{ type: "text", text: "hello" }],
+        },
       ];
 
       const result2 = await messagesTransform({}, { messages: messages2 });
 
       // Assert - Skill Reload now injected (consumed)
-      const skillReload2 = result2.messages[0].parts.find((p: any) => p.text?.includes("技能"));
+      const skillReload2 = result2.messages[0].parts.find((p: any) =>
+        p.text?.includes("技能"),
+      );
       expect(skillReload2).toBeDefined();
     } finally {
       process.env.HOME = originalHome;
@@ -951,11 +1039,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -971,7 +1059,9 @@ describe("Skill Reload Migration", () => {
 
     try {
       // Act
-      const systemTransform = hooks["experimental.chat.system.transform"] as any;
+      const systemTransform = hooks[
+        "experimental.chat.system.transform"
+      ] as any;
       const result = await systemTransform(
         { sessionID, model: { providerID: "test", modelID: "test" } },
         { system: ["Base prompt."] },
@@ -990,11 +1080,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -1009,23 +1099,38 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "continue" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "continue" }],
+      },
     ];
 
     try {
       // Act
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
       const result = await messagesTransform({}, { messages });
 
       // Assert - full recovery protocol injected as synthetic
-      const recoveryPart = result.messages[0].parts.find((p: any) => p.text?.includes("The session context has been compacted"));
+      const recoveryPart = result.messages[0].parts.find((p: any) =>
+        p.text?.includes("The session context has been compacted"),
+      );
       expect(recoveryPart).toBeDefined();
       expect(recoveryPart.synthetic).toBe(true); // Must be synthetic (invisible to TUI)
-      expect(recoveryPart.text).toContain("Execute recovery protocol immediately");
+      expect(recoveryPart.text).toContain(
+        "Execute recovery protocol immediately",
+      );
       expect(recoveryPart.text).toContain("<CRITICAL_RULE>");
-      expect(recoveryPart.text).toContain("Read key files from the compaction summary");
-      expect(recoveryPart.text).toContain("Reload previously loaded skills: space-master");
-      expect(recoveryPart.text).toContain("Search and load task-relevant memories");
+      expect(recoveryPart.text).toContain(
+        "Read key files from the compaction summary",
+      );
+      expect(recoveryPart.text).toContain(
+        "Reload previously loaded skills: space-master",
+      );
+      expect(recoveryPart.text).toContain(
+        "Search and load task-relevant memories",
+      );
       expect(recoveryPart.text).toContain("Check current session state");
       expect(recoveryPart.text).toContain("Check related project git status");
     } finally {
@@ -1037,11 +1142,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -1057,21 +1162,31 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages1 = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "continue" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "continue" }],
+      },
     ];
 
     const messages2 = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "next turn" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "next turn" }],
+      },
     ];
 
     try {
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
 
       // Act - first call: recoverySent=true skips injection and clears stale state
       const result1 = await messagesTransform({}, { messages: messages1 });
 
       // Assert - no recovery injection (recoverySent prevents duplicate)
-      const recoveryText = result1.messages[0].parts.find((p: any) => p.text?.includes("Execute recovery protocol immediately"));
+      const recoveryText = result1.messages[0].parts.find((p: any) =>
+        p.text?.includes("Execute recovery protocol immediately"),
+      );
       expect(recoveryText).toBeUndefined();
 
       // Assert - stale needsSkillReload was cleared
@@ -1081,7 +1196,9 @@ describe("Skill Reload Migration", () => {
 
       // Act - second turn: no legacy skill-reload duplicate
       const result2 = await messagesTransform({}, { messages: messages2 });
-      const skillReload2 = result2.messages[0].parts.find((p: any) => p.text?.includes("技能"));
+      const skillReload2 = result2.messages[0].parts.find((p: any) =>
+        p.text?.includes("技能"),
+      );
       expect(skillReload2).toBeUndefined();
     } finally {
       process.env.HOME = originalHome;
@@ -1092,11 +1209,11 @@ describe("Skill Reload Migration", () => {
     // Arrange - simulate manual compact: both needsRecoveryInjection and needsSkillReload are set
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -1112,21 +1229,31 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages1 = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "first" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "first" }],
+      },
     ];
 
     const messages2 = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "second" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "second" }],
+      },
     ];
 
     try {
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
 
       // Act - first call: full recovery injected (includes skills inline)
       const result1 = await messagesTransform({}, { messages: messages1 });
 
       // Assert - full recovery protocol injected as synthetic
-      const recovery1 = result1.messages[0].parts.find((p: any) => p.text?.includes("Execute recovery protocol immediately"));
+      const recovery1 = result1.messages[0].parts.find((p: any) =>
+        p.text?.includes("Execute recovery protocol immediately"),
+      );
       expect(recovery1).toBeDefined();
       expect(recovery1.synthetic).toBe(true);
       expect(recovery1.text).toContain("dev-flow");
@@ -1139,9 +1266,13 @@ describe("Skill Reload Migration", () => {
       const result2 = await messagesTransform({}, { messages: messages2 });
 
       // Assert - no legacy skill-reload duplicate
-      const skillReload2 = result2.messages[0].parts.find((p: any) => p.text?.includes("技能"));
+      const skillReload2 = result2.messages[0].parts.find((p: any) =>
+        p.text?.includes("技能"),
+      );
       expect(skillReload2).toBeUndefined();
-      const recovery2 = result2.messages[0].parts.find((p: any) => p.text?.includes("Execute recovery protocol immediately"));
+      const recovery2 = result2.messages[0].parts.find((p: any) =>
+        p.text?.includes("Execute recovery protocol immediately"),
+      );
       expect(recovery2).toBeUndefined();
     } finally {
       process.env.HOME = originalHome;
@@ -1152,11 +1283,11 @@ describe("Skill Reload Migration", () => {
     // Arrange
     const originalHome = process.env.HOME;
     process.env.HOME = testDir;
-    
+
     const { default: pluginDef } = await import("../index.js");
     const plugin = (pluginDef as { server: Function }).server.bind(pluginDef);
     const hooks = await plugin({
-      client: {} as any,
+      client: withV2Api({}) as any,
       project: {} as any,
       directory: testDir,
       worktree: testDir,
@@ -1171,20 +1302,30 @@ describe("Skill Reload Migration", () => {
     });
 
     const messages1 = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "first" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "first" }],
+      },
     ];
 
     const messages2 = [
-      { info: { role: "user", sessionID }, parts: [{ type: "text", text: "second" }] },
+      {
+        info: { role: "user", sessionID },
+        parts: [{ type: "text", text: "second" }],
+      },
     ];
 
     try {
       // Act - first call
-      const messagesTransform = hooks["experimental.chat.messages.transform"] as any;
+      const messagesTransform = hooks[
+        "experimental.chat.messages.transform"
+      ] as any;
       const result1 = await messagesTransform({}, { messages: messages1 });
 
       // Assert - recovery protocol injected
-      const recovery1 = result1.messages[0].parts.find((p: any) => p.text?.includes("Execute recovery protocol immediately"));
+      const recovery1 = result1.messages[0].parts.find((p: any) =>
+        p.text?.includes("Execute recovery protocol immediately"),
+      );
       expect(recovery1).toBeDefined();
       expect(recovery1.text).toContain("Execute recovery protocol immediately");
 
@@ -1192,7 +1333,9 @@ describe("Skill Reload Migration", () => {
       const result2 = await messagesTransform({}, { messages: messages2 });
 
       // Assert - no recovery (already consumed)
-      const recovery2 = result2.messages[0].parts.find((p: any) => p.text?.includes("Execute recovery protocol immediately"));
+      const recovery2 = result2.messages[0].parts.find((p: any) =>
+        p.text?.includes("Execute recovery protocol immediately"),
+      );
       expect(recovery2).toBeUndefined();
     } finally {
       process.env.HOME = originalHome;

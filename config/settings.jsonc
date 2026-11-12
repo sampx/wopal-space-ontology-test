@@ -1,8 +1,6 @@
 {
   "ellamaka": {
-    "default_agent": "wopal",
-    "autoupdate": true,
-    "plugin": [],
+    "autoupdate": "notify",
     "permission": {
       "external_directory": {
         "*": "ask",
@@ -21,25 +19,6 @@
         "wopal *": "allow",
         "bash -n *": "allow"
       }
-    }
-    // "skills": {
-    //   "paths": ["/Users/sam/coding/wopal/wopal-workspace/.agents/skills"]
-    // },
-  },
-  "tui": {
-    "plugin": [
-      [
-        "../plugins/tui-ellamaka.tsx",
-        {
-          "enabled": true,
-          "label": "WOPALSPACE"
-        }
-      ]
-    ],
-    "attention": {
-      "enabled": true,
-      "notifications": true,
-      "sound": true
     }
   }
 }

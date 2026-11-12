@@ -5,9 +5,60 @@ All functions work with an explicit repo_path to support multi-repo scenarios.
 """
 
 import subprocess
+import time
+from dataclasses import dataclass
 from pathlib import Path
 
-from lib.logging import log_error
+from lib.logging import log_error, log_warn
+
+# Retry budget for race self-healing on push (issue #215).
+PUSH_RETRY_LIMIT = 3
+PUSH_RETRY_DELAY = 0.5
+
+
+@dataclass
+class GitMutationFailure:
+    """Structured failure of a Git mutation command, with full diagnostics.
+
+    Returned instead of a bare False so callers can surface the root cause:
+    the failing command, its cwd, exit code, and raw stdout/stderr.
+
+    Falsy by design: existing `if not commit_paths(...)` checks keep working,
+    while `str(failure)` renders a labeled diagnostic for logs.
+    """
+
+    command: list[str]
+    cwd: str
+    exit_code: int
+    stdout: str
+    stderr: str
+
+    def __bool__(self) -> bool:
+        return False
+
+    @classmethod
+    def from_completed(
+        cls, command: list[str], cwd: str, result: subprocess.CompletedProcess,
+    ) -> "GitMutationFailure":
+        return cls(
+            command=list(command),
+            cwd=cwd,
+            exit_code=result.returncode,
+            stdout=result.stdout or "",
+            stderr=result.stderr or "",
+        )
+
+    def __str__(self) -> str:
+        lines = [
+            f"command: {' '.join(self.command)}",
+            f"cwd: {self.cwd}",
+            f"exit code: {self.exit_code}",
+        ]
+        if self.stdout.strip():
+            lines.append(f"stdout: {self.stdout.strip()}")
+        if self.stderr.strip():
+            lines.append(f"stderr: {self.stderr.strip()}")
+        return "\n".join(lines)
 
 
 def is_repo_dirty(repo_path: str, ignore_paths: list[str] | None = None) -> bool:
@@ -61,6 +112,29 @@ def get_dirty_lines(repo_path: str) -> list[str]:
     if result.returncode != 0:
         return []
     return [line for line in result.stdout.split("\n") if line.strip()]
+
+
+def paths_have_changes(
+    repo_path: str, paths: list[str]
+) -> bool | GitMutationFailure:
+    """Return whether named paths changed, or a structured status failure.
+
+    Query failure must stay distinct from a clean result. Formal Delivery
+    callers use this before deciding whether Plan metadata is durable; treating
+    a failed `git status` as clean can otherwise report false success.
+    """
+    if not paths:
+        return False
+    command = ["git", "status", "--porcelain", "--", *paths]
+    result = subprocess.run(
+        command,
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        return GitMutationFailure.from_completed(command, repo_path, result)
+    return bool(result.stdout.strip())
 
 
 def get_current_branch(repo_path: str) -> str:
@@ -121,7 +195,42 @@ def get_branch_head(repo_path: str, branch: str) -> str:
     return result.stdout.strip()
 
 
-def commit_all(repo_path: str, message: str) -> bool:
+def get_merge_base(repo_path: str, left: str, right: str) -> str:
+    """Return the merge-base SHA for two refs, or empty string on failure."""
+    result = subprocess.run(
+        ["git", "merge-base", left, right],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def commit_exists(repo_path: str, commit: str) -> bool:
+    """Return whether `commit` resolves to a commit object."""
+    if not commit:
+        return False
+    result = subprocess.run(
+        ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    return result.returncode == 0
+
+
+def get_commit_subject(repo_path: str, commit: str) -> str:
+    """Return a commit's subject verbatim, or empty string on failure."""
+    result = subprocess.run(
+        ["git", "show", "-s", "--format=%s", commit],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    return result.stdout.rstrip("\n") if result.returncode == 0 else ""
+
+
+def commit_all(repo_path: str, message: str) -> bool | GitMutationFailure:
     """Commit all changes with given message.
 
     Args:
@@ -129,19 +238,25 @@ def commit_all(repo_path: str, message: str) -> bool:
         message: Commit message
 
     Returns:
-        True if commit succeeded (or nothing to commit)
-        False if commit failed
+        True if commit succeeded (or nothing to commit);
+        GitMutationFailure (falsy) with command/cwd/exit/stdout/stderr
+        if `git add -A` or `git commit` failed
     """
     # Stage all changes
-    subprocess.run(
-        ["git", "add", "-A"],
+    add_cmd = ["git", "add", "-A"]
+    add_result = subprocess.run(
+        add_cmd,
         cwd=repo_path,
         capture_output=True,
+        text=True,
     )
+    if add_result.returncode != 0:
+        return GitMutationFailure.from_completed(add_cmd, repo_path, add_result)
 
     # Commit
+    commit_cmd = ["git", "commit", "-m", message]
     result = subprocess.run(
-        ["git", "commit", "-m", message],
+        commit_cmd,
         cwd=repo_path,
         capture_output=True,
         text=True,
@@ -149,7 +264,9 @@ def commit_all(repo_path: str, message: str) -> bool:
 
     # Git returns 1 if nothing to commit, which is acceptable
     # Return True for success (0) or nothing to commit
-    return result.returncode == 0 or "nothing to commit" in result.stdout
+    if result.returncode == 0 or "nothing to commit" in result.stdout:
+        return True
+    return GitMutationFailure.from_completed(commit_cmd, repo_path, result)
 
 
 def push(repo_path: str) -> bool:
@@ -174,42 +291,6 @@ def push(repo_path: str) -> bool:
     )
 
     return result.returncode == 0
-
-
-def is_git_repo(path: str) -> bool:
-    """Check if path is inside a git repository.
-
-    Args:
-        path: Any path to check
-
-    Returns:
-        True if path is inside a git repo
-    """
-    result = subprocess.run(
-        ["git", "rev-parse", "--is-inside-work-tree"],
-        cwd=path,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0 and result.stdout.strip() == "true"
-
-
-def get_repo_root(path: str) -> str:
-    """Get repository root directory from any path inside it.
-
-    Args:
-        path: Any path inside a git repo
-
-    Returns:
-        Absolute path to repo root, or empty string if not in a repo
-    """
-    result = subprocess.run(
-        ["git", "rev-parse", "--show-toplevel"],
-        cwd=path,
-        capture_output=True,
-        text=True,
-    )
-    return result.stdout.strip()
 
 
 def get_common_git_dir(path: str) -> str:
@@ -254,12 +335,21 @@ def is_commit_in_remote(repo_path: str, remote: str = "origin", branch: str = "m
         True if HEAD is ancestor of remote/branch (already pushed)
         False if HEAD is not pushed yet or cannot determine
     """
-    # Fetch remote first (silent)
-    subprocess.run(
-        ["git", "fetch", remote, branch],
+    # Fetch remote first — a failed fetch means the local tracking ref may
+    # be stale, so "already pushed" cannot be confirmed (B-04).
+    fetch_cmd = ["git", "fetch", remote, branch]
+    fetch = subprocess.run(
+        fetch_cmd,
         cwd=repo_path,
         capture_output=True,
+        text=True,
     )
+    if fetch.returncode != 0:
+        log_warn(
+            f"git fetch failed; cannot confirm HEAD is in {remote}/{branch}:\n"
+            f"{GitMutationFailure.from_completed(fetch_cmd, repo_path, fetch)}"
+        )
+        return False
 
     # Check if HEAD is ancestor of remote/branch
     result = subprocess.run(
@@ -270,21 +360,6 @@ def is_commit_in_remote(repo_path: str, remote: str = "origin", branch: str = "m
 
     # returncode 0 = HEAD is ancestor (already pushed)
     return result.returncode == 0
-
-
-def is_branch_merged(branch: str, target: str, repo_path: str = ".") -> bool:
-    """Check if branch has been merged into target.
-
-    Returns True if all commits from branch are reachable from target.
-    """
-    result = subprocess.run(
-        ["git", "merge-base", "--is-ancestor", branch, target],
-        cwd=repo_path,
-        capture_output=True,
-    )
-    return result.returncode == 0
-
-
 def get_relative_path(file_path: str, base_path: str) -> str:
     """Get relative path from base_path to file_path.
 
@@ -303,98 +378,6 @@ def get_relative_path(file_path: str, base_path: str) -> str:
     except ValueError:
         # file_path is not relative to base_path
         return str(file)
-
-
-def merge_branch(
-    repo_path: str,
-    branch: str,
-    target: str = 'main',
-    no_ff: bool = True,
-) -> tuple[bool, list[str]]:
-    """Merge branch into target branch.
-
-    Args:
-        repo_path: Path to git repository root
-        branch: Source branch to merge
-        target: Target branch to merge into (default: main)
-        no_ff: Use --no-ff for merge commit (default: True)
-
-    Returns:
-        Tuple of (success, conflict_files).
-        success: True if merge succeeded without conflicts.
-        conflict_files: List of files with conflicts (empty if success).
-    """
-    # Ensure we are on target branch
-    subprocess.run(
-        ["git", "checkout", target],
-        cwd=repo_path,
-        capture_output=True,
-    )
-
-    # Build merge command
-    cmd = ["git", "merge"]
-    if no_ff:
-        cmd.append("--no-ff")
-    cmd.append(branch)
-
-    result = subprocess.run(
-        cmd,
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode == 0:
-        return (True, [])
-
-    # Merge failed — check for conflicts
-    diff_result = subprocess.run(
-        ["git", "diff", "--name-only", "--diff-filter=U"],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    conflict_files = [
-        f for f in diff_result.stdout.strip().split('\n') if f
-    ]
-
-    if conflict_files:
-        # Abort the merge to leave repo in clean state
-        subprocess.run(
-            ["git", "merge", "--abort"],
-            cwd=repo_path,
-            capture_output=True,
-        )
-        return (False, conflict_files)
-
-    # Non-conflict failure
-    subprocess.run(
-        ["git", "merge", "--abort"],
-        cwd=repo_path,
-        capture_output=True,
-    )
-    return (False, [])
-
-
-def branch_exists(repo_path: str, branch: str) -> bool:
-    """Check if a local branch exists.
-
-    Args:
-        repo_path: Path to git repository root
-        branch: Branch name to check
-
-    Returns:
-        True if branch exists locally
-    """
-    result = subprocess.run(
-        ["git", "branch", "--list", branch],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    return bool(result.stdout.strip())
-
-
 def delete_branch(repo_path: str, branch: str, force: bool = False) -> bool:
     """Delete a local branch.
 
@@ -414,27 +397,6 @@ def delete_branch(repo_path: str, branch: str, force: bool = False) -> bool:
         text=True,
     )
     return result.returncode == 0
-
-
-def push_branch(repo_path: str, branch: str = 'main') -> bool:
-    """Push specified branch to origin.
-
-    Args:
-        repo_path: Path to git repository root
-        branch: Branch name to push (default: main)
-
-    Returns:
-        True if push succeeded
-    """
-    result = subprocess.run(
-        ["git", "push", "origin", branch],
-        cwd=repo_path,
-        capture_output=True,
-        text=True,
-    )
-    return result.returncode == 0
-
-
 def has_uncommitted_changes(repo_path: str) -> bool:
     """Check if repo has uncommitted changes. Alias for is_repo_dirty.
 
@@ -447,11 +409,12 @@ def has_uncommitted_changes(repo_path: str) -> bool:
     return is_repo_dirty(repo_path)
 
 
-def commit_paths(repo_root: str, paths: list[str], message: str) -> bool:
+def commit_paths(repo_root: str, paths: list[str], message: str) -> bool | GitMutationFailure:
     """Stage and commit specific paths in a given repo.
 
-    Only stages the listed paths (not git add -A), then commits.
-    Returns True if commit succeeded or there was nothing to commit.
+    Commits only the listed paths: `git commit` runs with a pathspec, so
+    entries staged by someone else never ride this commit and keep their
+    index state (a bare `git commit` would sweep the whole index).
 
     Args:
         repo_root: Path to git repository root
@@ -459,24 +422,45 @@ def commit_paths(repo_root: str, paths: list[str], message: str) -> bool:
         message: Commit message
 
     Returns:
-        True if commit succeeded or nothing to commit
+        True if commit succeeded or nothing to commit;
+        GitMutationFailure (falsy) with command/cwd/exit/stdout/stderr
+        if `git add` or `git commit` failed
     """
     if not paths:
         return True
 
-    # Stage specific paths
+    # Stage specific paths. A rename source no longer exists in the
+    # worktree, so `git add` rejects it as an unmatched pathspec even though
+    # its deletion is staged; retry with the paths that still exist — any
+    # other add failure (lock, permissions, unknown path) stays fatal.
+    add_cmd = ["git", "add", "--", *paths]
     add_result = subprocess.run(
-        ["git", "add", *paths],
+        add_cmd,
         cwd=repo_root,
         capture_output=True,
         text=True,
     )
     if add_result.returncode != 0:
-        return False
+        existing = [p for p in paths if (Path(repo_root) / p).exists()]
+        if not existing or existing == paths:
+            return GitMutationFailure.from_completed(add_cmd, repo_root, add_result)
+        retry_cmd = ["git", "add", "--", *existing]
+        retry_result = subprocess.run(
+            retry_cmd,
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if retry_result.returncode != 0:
+            return GitMutationFailure.from_completed(
+                retry_cmd, repo_root, retry_result,
+            )
 
-    # Commit
+    # Commit only the named paths (pathspec commit); unrelated staged
+    # entries are neither committed nor cleared.
+    commit_cmd = ["git", "commit", "-m", message, "--", *paths]
     commit_result = subprocess.run(
-        ["git", "commit", "-m", message],
+        commit_cmd,
         cwd=repo_root,
         capture_output=True,
         text=True,
@@ -489,31 +473,296 @@ def commit_paths(repo_root: str, paths: list[str], message: str) -> bool:
     if "nothing to commit" in commit_result.stdout:
         return True
 
-    return False
+    return GitMutationFailure.from_completed(commit_cmd, repo_root, commit_result)
 
 
-def push_repo(repo_root: str, branch: str | None = None) -> bool:
-    """Push a specific branch in a given repo.
+def _run_git(repo_root: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        ["git", *args],
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _is_ancestor(repo_root: str, older: str, newer: str) -> bool:
+    """True if commit `older` is an ancestor of (or equal to) `newer`."""
+    result = _run_git(repo_root, "merge-base", "--is-ancestor", older, newer)
+    return result.returncode == 0
+
+
+def is_ancestor(repo_root: str, older: str, newer: str) -> bool:
+    """Public ancestry predicate for command-layer Git state checks."""
+    return _is_ancestor(repo_root, older, newer)
+
+
+def integrate_branch(
+    repo_root: str,
+    *,
+    integration_branch: str,
+    work_branch: str,
+    delivery_base: str,
+    strategy: str,
+    commit_subject: str,
+) -> str | GitMutationFailure:
+    """Create one formal Delivery commit from a validated work branch.
+
+    The caller owns Plan/business validation. This helper owns all Git
+    mutations and returns the resulting formal commit SHA or structured Git
+    diagnostics on failure.
+    """
+    if not get_branch_head(repo_root, integration_branch):
+        return GitMutationFailure(
+            command=["git", "rev-parse", integration_branch], cwd=repo_root,
+            exit_code=1, stdout="", stderr=f"Unknown integration branch: {integration_branch}",
+        )
+    if not get_branch_head(repo_root, work_branch):
+        return GitMutationFailure(
+            command=["git", "rev-parse", work_branch], cwd=repo_root,
+            exit_code=1, stdout="", stderr=f"Unknown work branch: {work_branch}",
+        )
+    if not _is_ancestor(repo_root, delivery_base, work_branch):
+        return GitMutationFailure(
+            command=["git", "merge-base", "--is-ancestor", delivery_base, work_branch],
+            cwd=repo_root, exit_code=1, stdout="",
+            stderr="Delivery Base Commit is not an ancestor of Work Branch",
+        )
+    if not _is_ancestor(repo_root, delivery_base, integration_branch):
+        return GitMutationFailure(
+            command=["git", "merge-base", "--is-ancestor", delivery_base, integration_branch],
+            cwd=repo_root, exit_code=1, stdout="",
+            stderr="Delivery Base Commit is not an ancestor of Integration Branch",
+        )
+
+    current = get_current_branch(repo_root)
+    if current != integration_branch:
+        checkout_cmd = ["git", "checkout", integration_branch]
+        checkout = _run_git(repo_root, "checkout", integration_branch)
+        if checkout.returncode != 0:
+            return GitMutationFailure.from_completed(checkout_cmd, repo_root, checkout)
+
+    if strategy == "squash":
+        merge_cmd = ["git", "merge", "--squash", work_branch]
+        merge = _run_git(repo_root, "merge", "--squash", work_branch)
+        if merge.returncode != 0:
+            return GitMutationFailure.from_completed(merge_cmd, repo_root, merge)
+        commit_cmd = ["git", "commit", "-m", commit_subject]
+        commit = _run_git(repo_root, "commit", "-m", commit_subject)
+        if commit.returncode != 0:
+            return GitMutationFailure.from_completed(commit_cmd, repo_root, commit)
+    elif strategy == "preserve-history":
+        merge_cmd = ["git", "merge", "--no-ff", work_branch, "-m", commit_subject]
+        merge = _run_git(
+            repo_root, "merge", "--no-ff", work_branch, "-m", commit_subject
+        )
+        if merge.returncode != 0:
+            return GitMutationFailure.from_completed(merge_cmd, repo_root, merge)
+    else:
+        return GitMutationFailure(
+            command=["git", "merge"], cwd=repo_root, exit_code=1,
+            stdout="", stderr=f"Unsupported Integration Strategy: {strategy}",
+        )
+
+    head = get_branch_head(repo_root, integration_branch)
+    if not head:
+        return GitMutationFailure(
+            command=["git", "rev-parse", integration_branch], cwd=repo_root,
+            exit_code=1, stdout="", stderr="Could not resolve formal Integration Commit",
+        )
+    return head
+
+
+def fast_forward_from_remote(
+    repo_root: str, branch: str, remote: str = "origin"
+) -> str | GitMutationFailure:
+    """Fetch `remote/branch`, checkout branch, and fast-forward to it."""
+    fetch_cmd = ["git", "fetch", remote, branch]
+    fetch = _run_git(repo_root, "fetch", remote, branch)
+    if fetch.returncode != 0:
+        return GitMutationFailure.from_completed(fetch_cmd, repo_root, fetch)
+
+    current = get_current_branch(repo_root)
+    if current != branch:
+        checkout_cmd = ["git", "checkout", branch]
+        checkout = _run_git(repo_root, "checkout", branch)
+        if checkout.returncode != 0:
+            return GitMutationFailure.from_completed(checkout_cmd, repo_root, checkout)
+
+    remote_ref = f"{remote}/{branch}"
+    merge_cmd = ["git", "merge", "--ff-only", remote_ref]
+    merge = _run_git(repo_root, "merge", "--ff-only", remote_ref)
+    if merge.returncode != 0:
+        return GitMutationFailure.from_completed(merge_cmd, repo_root, merge)
+
+    head = get_branch_head(repo_root, branch)
+    if not head:
+        return GitMutationFailure(
+            command=["git", "rev-parse", branch], cwd=repo_root,
+            exit_code=1, stdout="", stderr=f"Could not resolve branch head: {branch}",
+        )
+    return head
+
+
+def push_repo(repo_root: str, branch: str | None = None) -> bool | GitMutationFailure:
+    """Push a specific branch in a given repo, healing parallel-run races.
 
     If branch is None, pushes the current branch.
+
+    When the push is rejected because another process advanced the remote
+    (the parallel flow.sh race, issue #215), this function self-heals:
+
+    - origin tip is an ancestor of HEAD  -> plain retry after fetch
+    - HEAD is an ancestor of origin tip  -> fetch + `git merge --ff-only`
+      to catch up locally, then retry
+    - true divergence with a dirty tree -> no recovery attempt (never
+      autostash/rebase/force); returns False with manual instructions
 
     Args:
         repo_root: Path to git repository root
         branch: Branch name to push (None = current branch)
 
     Returns:
-        True if push succeeded
+        True if push succeeded; GitMutationFailure (falsy) carrying the
+        decisive attempt's command/cwd/exit/stdout/stderr otherwise.
+        Intermediate recovery failures (fetch, fast-forward) are logged with
+        full diagnostics as well, so no attempt's evidence is lost.
     """
     if branch is None:
         branch = get_current_branch(repo_root)
         if not branch:
-            return False
+            return GitMutationFailure(
+                command=["git", "push", "origin"],
+                cwd=repo_root,
+                exit_code=1,
+                stdout="",
+                stderr="Cannot push: no current branch (detached HEAD)",
+            )
 
-    result = subprocess.run(
-        ["git", "push", "origin", branch],
+    last_failure: GitMutationFailure | None = None
+    for attempt in range(1, PUSH_RETRY_LIMIT + 1):
+        push_cmd = ["git", "push", "origin", branch]
+        result = _run_git(repo_root, "push", "origin", branch)
+        if result.returncode == 0:
+            return True
+
+        last_failure = GitMutationFailure.from_completed(
+            push_cmd, repo_root, result,
+        )
+
+        rejected = "non-fast-forward" in (result.stderr or "") or \
+            "! [rejected]" in (result.stderr or "")
+        if not rejected:
+            # Unrelated failure (network, auth, permissions): not healable here.
+            log_error(f"Push failed:\n{last_failure}")
+            return last_failure
+
+        if attempt == PUSH_RETRY_LIMIT:
+            break
+
+        fetch_cmd = ["git", "fetch", "origin", branch]
+        fetch = _run_git(repo_root, "fetch", "origin", branch)
+        if fetch.returncode != 0:
+            log_error(
+                "Push rejected and the recovery fetch also failed:\n"
+                f"{GitMutationFailure.from_completed(fetch_cmd, repo_root, fetch)}\n"
+                f"Rejected push attempt:\n{last_failure}"
+            )
+            return last_failure
+
+        remote_ref = f"origin/{branch}"
+        if _is_ancestor(repo_root, remote_ref, "HEAD"):
+            # Our HEAD already contains everything on the remote: a plain
+            # retry after the fetch refresh will fast-forward the remote.
+            time.sleep(PUSH_RETRY_DELAY)
+            continue
+        if _is_ancestor(repo_root, "HEAD", remote_ref):
+            # We are strictly behind: fast-forward our branch to the remote,
+            # then retry the push. Safe on a clean tree only.
+            dirty = _run_git(repo_root, "status", "--porcelain")
+            if dirty.stdout.strip():
+                log_warn(
+                    f"Push rejected: local branch is behind origin/{branch} "
+                    f"and the worktree is dirty. Manual step: cd {repo_root} "
+                    f"&& git pull --ff-only && git push"
+                )
+                return last_failure
+            merge_cmd = ["git", "merge", "--ff-only", remote_ref]
+            merge = _run_git(repo_root, "merge", "--ff-only", remote_ref)
+            if merge.returncode != 0:
+                log_error(
+                    "Fast-forward recovery failed:\n"
+                    f"{GitMutationFailure.from_completed(merge_cmd, repo_root, merge)}\n"
+                    f"Rejected push attempt:\n{last_failure}"
+                )
+                return last_failure
+            time.sleep(PUSH_RETRY_DELAY)
+            continue
+
+        # True divergence. Only attempt healing on a clean tree, and never
+        # rebase/autostash (space regulations forbid unowned stashes).
+        dirty = _run_git(repo_root, "status", "--porcelain")
+        if dirty.stdout.strip():
+            log_warn(
+                f"Push rejected: local and origin/{branch} have diverged and "
+                f"the worktree is dirty. Manual step: cd {repo_root} && "
+                f"git pull --ff-only, resolve, commit, then git push"
+            )
+            return last_failure
+        log_warn(
+            f"Push rejected: local and origin/{branch} have diverged. "
+            f"Manual step: cd {repo_root} && git pull --ff-only, resolve, "
+            f"commit, then git push"
+        )
+        return last_failure
+
+    log_error(
+        f"Push failed after {PUSH_RETRY_LIMIT} attempts "
+        f"(commit is safe locally):\n{last_failure}\n"
+        f"Retry: cd {repo_root} && git push"
+    )
+    assert last_failure is not None
+    return last_failure
+
+
+def is_commit_pushed(repo_root: str, branch: str, commit: str = "HEAD") -> bool:
+    """Check that `commit` is contained in origin/<branch>.
+
+    A successful `git push` updates the remote-tracking ref in the same
+    command, so the local check is normally decisive. When the tracking
+    ref is missing (e.g. a fresh clone pushing a new branch, or a
+    single-branch clone whose fetch refspec doesn't map other branches),
+    query the remote directly via `git ls-remote` so the verification
+    does not depend on a tracking ref that may never be created (W-01).
+
+    Args:
+        repo_root: Path to git repository root
+        branch: Branch name expected to carry the commit on origin
+        commit: Commit-ish to verify (default: HEAD)
+
+    Returns:
+        True when commit is an ancestor of (or equal to) the remote ref
+    """
+    remote_ref = f"origin/{branch}"
+    if _is_ancestor(repo_root, commit, remote_ref):
+        return True
+    # Tracking ref missing — query the remote directly. ls-remote works
+    # without a local tracking ref and without depending on fetch refspec
+    # configuration (single-branch clones).
+    ls_cmd = ["git", "ls-remote", "origin", branch]
+    ls = subprocess.run(
+        ls_cmd,
         cwd=repo_root,
         capture_output=True,
         text=True,
+    )
+    if ls.returncode != 0 or not ls.stdout.strip():
+        return False
+    remote_sha = ls.stdout.split()[0]
+    # Check if commit is an ancestor of (or equal to) the remote SHA.
+    result = subprocess.run(
+        ["git", "merge-base", "--is-ancestor", commit, remote_sha],
+        cwd=repo_root,
+        capture_output=True,
     )
     return result.returncode == 0
 
@@ -522,7 +771,7 @@ def check_branch_merged(workspace_root: Path, plan_path: str) -> int:
     """Check that the feature branch has been merged to the integration branch.
 
     Reads Plan Worktree metadata to get the feature branch name,
-    determines the integration branch based on project type, and runs
+    determines the integration branch, and runs
     git branch --merged to verify.
 
     Args:
@@ -547,14 +796,8 @@ def check_branch_merged(workspace_root: Path, plan_path: str) -> int:
     else:
         repo_root = str(workspace_root)
 
-    # Determine integration branch based on project type
-    project_type = get_plan_field(plan_path, "Project Type")
-    if project_type == "ontology-worktree":
-        # .wopal/ worktree sits on the current space layer branch (space/<name>),
-        # detected at runtime — there is no fixed integration branch name.
-        integration_branch = get_current_branch(repo_root)
-    else:
-        integration_branch = "main"
+    # Determine integration branch
+    integration_branch = "main"
 
     # Prefer Verification Commit SHA — works even if branch ref is deleted
     verification_commit = get_plan_field(plan_path, "Verification Commit")
@@ -602,9 +845,29 @@ def check_branch_merged(workspace_root: Path, plan_path: str) -> int:
     # Changeset criterion: full-tree equality fails when the integration
     # branch advanced after the feature branched (parallel commits on main
     # make the trees differ even after a clean squash). Instead compare the
-    # paths the feature actually changed against the integration branch —
-    # if every changed path is byte-identical in both branches, the feature
-    # content is merged regardless of unrelated main progress.
+    # paths the feature actually changed against the integration branch.
+    #
+    # Two sub-criteria, tried per changed path:
+    #   1. Byte-identical: `git diff --quiet integration feature -- path`.
+    #      True when the path is unchanged in both branches.
+    #   2. Blob-presence fallback: when the byte check fails (main evolved
+    #      after the feature was squash-merged and later fixed the file), the
+    #      feature blob may still have entered integration history. Resolve
+    #      the feature blob with `git rev-parse <feature>:<path>` and ask
+    #      `git log <integration> --find-object=<blob> --oneline -- <path>`.
+    #      Non-empty output means the blob entered integration history, so the
+    #      feature content is merged regardless of later main edits.
+    #
+    # Deletion boundary: if `git rev-parse <feature>:<path>` fails, the path is
+    # absent in feature (deleted). Then `git cat-file -e <integration>:<path>`
+    # decides: if integration also lacks the path, the deletion was absorbed by
+    # the merge; if integration still has it, the deletion was not merged.
+    #
+    # Inherent false-positive boundary: if main independently evolves to a
+    # byte-identical blob (same content = same object), git content addressing
+    # cannot distinguish "introduced by merge" from "written independently".
+    # This coincidence is accepted in practice (verify is gated by user
+    # validation and the probability is negligible).
     try:
         base_res = subprocess.run(
             ["git", "merge-base", integration_branch, feature_branch],
@@ -638,11 +901,89 @@ def check_branch_merged(workspace_root: Path, plan_path: str) -> int:
                         capture_output=True,
                         text=True,
                     )
-                    if check.returncode != 0:
+                    if check.returncode == 0:
+                        # Byte-identical: path merged.
+                        continue
+                    # Byte check failed: fall back to blob-presence.
+                    blob_res = subprocess.run(
+                        ["git", "rev-parse", f"{feature_branch}:{p}"],
+                        cwd=repo_root,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if blob_res.returncode == 0 and blob_res.stdout.strip():
+                        # Path exists in feature: check blob entered history.
+                        blob_sha = blob_res.stdout.strip()
+                        log_res = subprocess.run(
+                            [
+                                "git", "log", integration_branch,
+                                "--find-object=" + blob_sha,
+                                "--oneline", "--", p,
+                            ],
+                            cwd=repo_root,
+                            capture_output=True,
+                            text=True,
+                        )
+                        if log_res.returncode == 0 and log_res.stdout.strip():
+                            # Feature blob entered integration history.
+                            continue
                         all_present = False
                         break
+                    # Path absent in feature (deleted): check deletion absorbed.
+                    cat_res = subprocess.run(
+                        ["git", "cat-file", "-e", f"{integration_branch}:{p}"],
+                        cwd=repo_root,
+                        capture_output=True,
+                        text=True,
+                    )
+                    if cat_res.returncode != 0:
+                        # Integration also lacks the path: deletion absorbed.
+                        continue
+                    # Integration still has the path: deletion not merged.
+                    all_present = False
+                    break
                 if all_present:
                     return 0
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        pass
+
+    # L4: three-way merge-tree criterion. The most general content check.
+    # `git merge-tree --write-tree <integration> <feature>` computes the
+    # three-way merge of base + integration + feature. When every feature
+    # change is already absorbed into the integration branch — regardless of
+    # how it got there (squash, manual port, or parallel edits fused into a
+    # new blob) — the merge result equals the integration tree itself:
+    # there is nothing left to merge.
+    #
+    # This covers the case L3 blob-presence cannot: main evolved the same
+    # file after the feature branched (parallel commit), the squash merge
+    # fused both sides into a blob that never existed in either branch, so
+    # the feature blob never entered integration history. Verified against
+    # the real ellamaka squash merge (sidebar.tsx + bun.lock).
+    #
+    # Conflict boundary: when integration and feature edits conflict,
+    # --write-tree exits non-zero and the criterion does not pass — the
+    # merged check falls through to branch-ref detection below (conservative).
+    try:
+        mt_res = subprocess.run(
+            ["git", "merge-tree", "--write-tree", integration_branch, feature_branch],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        int_res = subprocess.run(
+            ["git", "rev-parse", f"{integration_branch}^{{tree}}"],
+            cwd=repo_root,
+            capture_output=True,
+            text=True,
+        )
+        if (
+            mt_res.returncode == 0
+            and int_res.returncode == 0
+            and mt_res.stdout.strip()
+            and mt_res.stdout.strip() == int_res.stdout.strip()
+        ):
+            return 0
     except (subprocess.CalledProcessError, FileNotFoundError):
         pass
 

@@ -14,12 +14,12 @@ Wopal 专用 ellamaka 运行时插件 — 规则注入、任务委派、记忆�
 
 | 模块 | 职责 | 禁用开关 |
 |------|------|---------|
-| Global (`index.ts`) | 加载 .env、检查开关、注册 Hooks/Tools | 无 |
-| Rules (`rules/`) | 规则发现 → 条件匹配 → 注入系统提示词 | `WOPAL_RULES_INJECTION_ENABLED` |
-| Memory (`memory/`) | LanceDB 存储、语义检索、蒸馏注入 | `WOPAL_MEMORY_ENABLED`（总控）、`WOPAL_MEMORY_INJECTION_ENABLED`（仅注入） |
+| Global (`index.ts`) | 加载 .env、消费引擎交付配置、注册 Hooks/Tools | 无 |
+| Rules (`rules/`) | 规则发现 → 条件匹配 → 注入用户消息 | `pluginConfig["wopal-plugin"].rules.enabled` — opt-in，默认 `false` |
+| Memory (`memory/`) | LanceDB 存储、语义检索、记忆注入 | `pluginConfig["wopal-plugin"].memory.enabled`（总控）、`.memory.injection`（仅注入） |
 | Task (`tasks/`) | 非阻塞子会话、状态监控、双向通信、并发控制 | 无 |
 | Monitor (`monitor/`) | 周期性调度引擎，统一管理监控策略 | 无 |
-| Context (`hooks/`) | 会话摘要、上下文压缩与恢复 | 无 |
+| Context (`hooks/`, `context/`) | 会话压缩与恢复、标题生成、蒸馏 | `pluginConfig["wopal-plugin"].context.enabled` — 门控标题/恢复/蒸馏，压缩恒启用 |
 
 | 目录 | 职责 |
 |------|------|
@@ -32,7 +32,7 @@ Wopal 专用 ellamaka 运行时插件 — 规则注入、任务委派、记忆�
 | `src/rules/` | 规则发现、匹配、格式化 |
 | `scripts/` | CLI 工具、迁移、验证辅助脚本 |
 
-部署：`.wopal/plugins/wopal-plugin.ts` → symlink → `src/index.ts`。
+部署：在 `config/settings.jsonc` 中以相对路径 `../plugins/wopal-plugin/src/index.ts` 声明。
 
 ## 3. 开发命令
 
@@ -53,6 +53,28 @@ Wopal 专用 ellamaka 运行时插件 — 规则注入、任务委派、记忆�
 `bun run typecheck:fix` → `bun run typecheck` → `bun run test:run`。
 
 `typecheck:fix` 无法处理的类型问题必须人工修复，禁止跳过直接提交。`build` 仅用于产物验证/发布，不作为日常校验。
+
+### 验证机制
+
+单元测试无法覆盖的运行时行为（插件引导、真实文件配置加载、资源构建、工具注册）通过 headless 启动 ellamaka 针对真实空间验证：
+
+```bash
+# 从空间根目录执行；插件日志输出到 stderr 并追加到日志文件。
+ellamaka run "reply with exactly: OK" --print-logs --log-level DEBUG
+```
+
+输出落至 `<space>/.wopal-space/logs/wopal-plugin.log`。关键引导标记：
+
+| 标记 | 含义 |
+|------|------|
+| `Runtime context initialized` | 空间根与 `wopalHome` 已解析 |
+| `Effective wopal config loaded` | 引擎交付的插件配置已消费；生效快照落日志，密钥已脱敏 |
+| `Resources resolved` | store / embedder / llm 中哪些已构建 |
+| `Plugin initialized` | 最终工具清单与 `memory` 标志 |
+
+配置驱动行为使用 `.wopal-space/.tmp/` 下的隔离 fixture 验证（禁止修改用户真实 `settings.local.jsonc`）；`loadWopalConfig` 支持注入 `pluginConfig` 切片 / `inlineOptions` / `fallbackEnvironment` 用于此目的。
+
+`WOPAL_HOME` 覆盖用户级配置与存储根，使沙箱化运行成为可能。
 
 ## 4. 实现规则
 
@@ -77,12 +99,30 @@ Wopal 专用 ellamaka 运行时插件 — 规则注入、任务委派、记忆�
 - 结构化字段用 `data` 对象传递，字段命名 snake_case；禁止拼接到 message
 - 错误日志必须携带 `{ err: error }`，禁止只记 `error.message`
 - sessionID 格式：`formatSessionID(sessionID, isTask)` → `<last10chars>(main|task)`
+- 模块级 logger 是进程级单例，但一个进程可承载多个 runtime（每空间一个）；其写入目标**不得在 import 时冻结**，必须跟随当前 runtime
+  - `createPluginRuntime` 组装 runtime 时必须调用 `bindLoggerRuntime(context, env, config)` 绑定目标；未绑定时才回退到进程环境
+  - 绑定后单例调用点写入该 runtime 的 `logDir`；未绑定会落到全局 `<WOPAL_HOME>/logs`，使空间实例的日志写错位置
+  - `src/logger-runtime-binding.test.ts` 是回归守卫，断言绑定/回退/最后写入生效三种路由
+
+### 路径解析
+
+- `WOPAL_HOME` 一律经 `resolveWopalHome()`（`src/paths.ts`）归一化后才能转成路径，禁止直接喂给 `path.join`
+  - 环境中的值可能是未展开的字面量 `~/.wopal`；`join("~/.wopal", "logs")` 得到**相对**路径，会按进程 cwd 解析，在插件目录内长出垃圾 `~/` 目录
+  - 归一化负责：展开前导 `~` → 绝对化 → 空值兜底 `<home>/.wopal`
+- 测试全局由 `src/test-setup.ts` 把 `WOPAL_HOME` 钉到临时目录（绝对路径）；测试若自行改写必须恢复到该隔离值
+- `src/test-isolation.test.ts` 是回归守卫，断言写入路径既不在插件 cwd 内、也不在真实 `~/.wopal` 内
 
 ### 模块边界
 
 - **tasks**：`SimpleTaskManager` 周期性监控必须通过 `MonitorStrategy` 注册到 `MonitorEngine`
 - **monitor**：新增监控策略只需实现 `MonitorStrategy` 接口并注册到 engine，禁止在其他模块新建独立调度链
-- **memory**：`MemoryStore` 是唯一持久层入口；记录使用 `tags` 字段（非 `concepts`）；蒸馏走 `preview → confirm` 两步，禁止跳过用户审查直接写入
+- **memory**：`MemoryStore` 是唯一持久层入口；记录使用 `tags` 字段（非 `concepts`）
+- **context**：蒸馏走 `preview → confirm` 两步，禁止跳过用户审查直接写入
+
+### Agent 工具
+
+- `memory_manage`：纯记忆操作 — list/stats/search/add/update/delete/injected；记忆 store 可用时注册
+- `context_manage`：会话上下文 — status/dump/compact，以及蒸馏动作 distill/confirm/cancel；蒸馏要求 context 能力（`context.enabled`）
 
 ### `promptAsync` 会话模型纪律
 
@@ -97,8 +137,9 @@ Wopal 专用 ellamaka 运行时插件 — 规则注入、任务委派、记忆�
 - **新增工具**：在 `tools/` 下新建文件，在 `tools/index.ts` 的 `createWopalTools()` 中注册；任务工具统一 `wopal_task_*` 前缀
 - **新增记忆分类**：在 `memory/categories.ts` 添加，标识符用英文，重要性 0-1
 - **新增监控策略**：实现 `MonitorStrategy` 接口，注册到 `MonitorEngine`
-- **新增环境变量**：`WOPAL_` 前缀 + `UPPER_SNAKE_CASE`；必须在调试开关表和 `loadWopalEnv()` 中同步补齐
-- **新增 HookContext 字段**：必须可选（`?: boolean`，默认 `true`），保持向后兼容
+- **新增环境变量**：`WOPAL_` 前缀 + `UPPER_SNAKE_CASE`；必须在调试开关表中同步补齐。功能开关归属配置，不进 env
+- **新增配置节点**：在 `src/config/schema.ts` 中添加并声明默认值（经 `pluginConfig["wopal-plugin"]` 交付）；在第 8 节文档化
+- **新增 HookContext 字段**：必须可选（`?: boolean`），保持向后兼容。保持既有行为的能力门控默认 `true`；opt-in 开关（如 `rulesInjectionEnabled`）默认必须为 `false`
 
 ### 命名约定
 
@@ -109,7 +150,7 @@ Wopal 专用 ellamaka 运行时插件 — 规则注入、任务委派、记忆�
 | 工具定义 | `wopal-task-*.ts` | `wopal-task-output.ts` |
 | Hook 函数 | `create*` 工厂模式 | `createAllHooks()` |
 | Logger | 模块级单例，从 `logger.ts` 导入 | `taskLogger`、`memoryLogger` |
-| 环境变量 | `WOPAL_` + `UPPER_SNAKE_CASE` | `WOPAL_MEMORY_ENABLED` |
+| 环境变量 | `WOPAL_` + `UPPER_SNAKE_CASE` | `WOPAL_PLUGIN_LOG_LEVEL` |
 
 ### 错误处理
 
@@ -130,14 +171,15 @@ Wopal 专用 ellamaka 运行时插件 — 规则注入、任务委派、记忆�
 
 ## 5. 测试
 
-- 遵循 TDD：先写失败测试，再实现使其通过
+- 插件行为变更只要满足 canonical `rules/testing.md` 的 TDD 适用条件，就必须使用 TDD；失败断言放在可观察的插件行为边界，不测试私有实现结构。
 - 新增模块必须有 `*.test.ts`，覆盖主路径和边界条件
 - 代码风格：TypeScript ESM，`.js` 后缀导入；Vitest 框架，测试与源文件同目录
 
 ## 6. 禁止
 
 - `console.log`（用模块级 logger）
-- npm / pnpm（只允许 Bun）
+- npm / pnpm（只允许 Bun）— Bun 是唯一工具链。插件目录内禁止出现 `pnpm-lock.yaml`、`pnpm-workspace.yaml`、`package-lock.json`，锁文件仅认 `bun.lock`；native postinstall 构建由 `package.json` 的 `trustedDependencies` 声明，禁止用 pnpm `onlyBuiltDependencies` 或 npm scripts 承载
+- 从 `@opencode-ai/*` 导入契约或 SDK 类型 — fork 契约类型（`SystemPromptMetadata` 等）从 `@wopal/ellamaka-plugin` 导入，SDK 消费点（`createOpencodeClient`、`Model`）从 `@wopal/ellamaka-sdk` 导入；禁止在 `types.ts` 手抄 fork 类型（残留的本地定义与契约层同构却会静默漂移）
 - `^` 前缀引用 LanceDB — `@lancedb/lancedb` 和 `@lancedb/lancedb-darwin-x64` 必须精确版本一致（当前 `0.22.3`），ABI 不兼容会导致记忆系统崩溃
 - 在 `system-transform.ts` 直接拼接注入内容
 - 跨模块混用 logger
@@ -146,9 +188,24 @@ Wopal 专用 ellamaka 运行时插件 — 规则注入、任务委派、记忆�
 
 | 变量 | 默认值 | 说明 |
 |------|--------|------|
-| `WOPAL_PLUGIN_LOG_LEVEL` | `info` | 日志阈值：trace/debug/info/warn/error/fatal |
-| `WOPAL_PLUGIN_LOG_FILE` | `<cwd>/.wopal-space/logs/wopal-plugin.log` | 日志文件路径 |
-| `WOPAL_PLUGIN_LOG_MODULES` | (空) | 模块过滤（逗号分隔），空=全部。可选：core/rules/task/memory/context |
-| `WOPAL_RULES_INJECTION_ENABLED` | `true` | Rules 模块整体 |
-| `WOPAL_MEMORY_ENABLED` | `true` | Memory 模块整体（关闭时 `MEMORY_INJECTION` 被忽略） |
-| `WOPAL_MEMORY_INJECTION_ENABLED` | `true` | 仅 Memory 注入 |
+| `WOPAL_PLUGIN_LOG_LEVEL` | `info` | 日志阈值：trace/debug/info/warn/error/fatal（env 覆盖；配置 `pluginConfig["wopal-plugin"].logLevel` 为默认来源） |
+| `WOPAL_PLUGIN_LOG_FILE` | `<cwd>/.wopal-space/logs/wopal-plugin.log` | 日志文件路径（env 覆盖；配置 `pluginConfig["wopal-plugin"].logFile` 为默认来源） |
+| `WOPAL_PLUGIN_LOG_MODULES` | (空) | 模块过滤（逗号分隔），空=全部。可选：core/rules/task/memory/context（env 覆盖；配置 `pluginConfig["wopal-plugin"].logModules` 为默认来源） |
+| `ELLAMAKA_LOG_LEVEL` | (未设置) | 宿主统一日志级别兜底（DEBUG/INFO/WARN/ERROR，读取时归一化为小写）。仅当 `WOPAL_PLUGIN_LOG_LEVEL` 与配置 `logLevel` 均无有效级别时生效；仅从真实进程环境读取，不从 `.env` 读取 |
+
+## 8. 配置节点（`wopal.pluginConfig["wopal-plugin"]`）
+
+功能开关与连接配置位于三层 settings 的 `wopal.pluginConfig["wopal-plugin"]` 条目（`global` → `space-public` → `space-local`，后者覆盖前者）。引擎深合并三层并经 `PluginInput.pluginConfig` 交付生效条目；插件只消费内存切片，不读任何 settings 文件。
+
+| 节点 | 字段 | 说明 |
+|------|------|------|
+| `rules` | `enabled` | 默认 `false`。opt-in 开关：仅在设为 `true` 时执行规则发现与注入 |
+| `memory` | `enabled`, `injection` | 默认均为 `true`；`injection=false` 停止自动注入但保留 `memory_manage` 与检索 |
+| `context` | `enabled` | 默认 `true`；门控标题生成、自动恢复与蒸馏；压缩恒启用 |
+| `llm` | `baseUrl`, `model`, `apiKey` | apiKey 支持 `$VAR`：process.env 优先、`.env` 兜底；禁止存放明文密钥 |
+| `embedding` | `baseUrl`, `model`, `apiKey` | `$VAR` 语义与 `llm` 相同 |
+| `logLevel` / `logFile` / `logModules` | — | 配置为默认来源；`WOPAL_PLUGIN_LOG_*` env 覆盖 |
+
+优先级：内置默认 < 内联挂载 options（兼容层）< 引擎交付的 `pluginConfig["wopal-plugin"]`。插件将两者叠加并严格校验——非法条目启动即失败。层级合并与 `wopal.pluginConfig` 外层表的形状归引擎所有。
+
+`.env` 文件仅承载经 `$VAR` 引用的密钥（如 `WOPAL_LLM_API_KEY`）与日志诊断覆盖项；功能开关一律不进 `.env`。

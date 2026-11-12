@@ -1,7 +1,6 @@
 """verify_switch command — unified verification switch for dev-flow.
 
 Switches workspace to feature branch for verification:
-  - ontology-worktree: git checkout .wopal/ to feature branch
   - standard: git checkout project repo to feature branch + remove worktree
 """
 
@@ -9,11 +8,12 @@ import re
 import subprocess
 from pathlib import Path
 
-from lib.git import commit_paths, get_current_branch, get_dirty_lines, get_relative_path
-from lib.workspace import find_workspace_root, get_ontology_main_repo
-from lib.worktree import parse_worktree_context
-from lib.logging import log_info, log_success, log_error, log_warn, log_step
-from plan import find_plan, get_plan_field, get_plan_project_path, resolve_project_path
+from lib.git import commit_paths, get_dirty_lines, GitMutationFailure
+from lib.project import resolve_plan_location
+from lib.workspace import find_workspace_root
+from lib.worktree import parse_worktree_context, remove_worktree_path
+from lib.logging import log_success, log_error, log_warn, log_step
+from plan import find_plan, get_plan_field, resolve_project_path
 
 
 
@@ -26,14 +26,18 @@ def _git_fetch(cwd: str) -> bool:
     Returns:
         True if fetch succeeded
     """
+    cmd = ["git", "fetch"]
     result = subprocess.run(
-        ["git", "fetch"],
+        cmd,
         cwd=cwd,
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        log_error(f"git fetch failed: {result.stderr.strip()}")
+        log_error(
+            "git fetch failed:\n"
+            f"{GitMutationFailure.from_completed(cmd, cwd, result)}"
+        )
         return False
     return True
 
@@ -48,23 +52,63 @@ def _git_checkout(branch: str, cwd: str) -> bool:
     Returns:
         True if checkout succeeded
     """
+    cmd = ["git", "checkout", branch]
     result = subprocess.run(
-        ["git", "checkout", branch],
+        cmd,
         cwd=cwd,
         capture_output=True,
         text=True,
     )
     if result.returncode != 0:
-        log_error(f"git checkout {branch} failed: {result.stderr.strip()}")
+        log_error(
+            f"git checkout {branch} failed:\n"
+            f"{GitMutationFailure.from_completed(cmd, cwd, result)}"
+        )
         return False
     return True
 
 
-def _remove_worktree(repo_root: str, worktree_path: str) -> bool:
-    """Remove a git worktree and prune stale references.
+def _prune_worktrees(repo_root: str) -> list[str]:
+    """Prune stale worktree references; report failures, never swallow them.
 
-    Uses git worktree remove --force then git worktree prune
-    to ensure complete cleanup (avoids "branch already used by worktree" errors).
+    `git worktree prune` may exit 0 while printing a deletion error to
+    stderr (e.g. Permission denied), so both the exit code and stderr are
+    inspected. Prune is janitorial: problems are returned for the caller to
+    report without aborting the switch.
+
+    Args:
+        repo_root: Path to the git repository root
+
+    Returns:
+        List of problem descriptions (empty when prune was clean).
+    """
+    cmd = ["git", "worktree", "prune"]
+    result = subprocess.run(
+        cmd,
+        cwd=repo_root,
+        capture_output=True,
+        text=True,
+    )
+    problems: list[str] = []
+    if result.returncode != 0:
+        problems.append(
+            "git worktree prune failed:\n"
+            f"{GitMutationFailure.from_completed(cmd, repo_root, result)}"
+        )
+    elif result.stderr.strip():
+        problems.append(
+            f"git worktree prune reported errors: {result.stderr.strip()}"
+        )
+    return problems
+
+
+def _remove_worktree(repo_root: str, worktree_path: str) -> bool:
+    """Remove a worktree with bounded, checked forced cleanup when needed.
+
+    Normal removal keeps ignored test and build output safe. If Git refuses a
+    clean worktree solely because it contains an initialized submodule, the
+    shared helper rechecks local work before forcing removal. Local-only work
+    always stops the switch.
 
     Args:
         repo_root: Path to the git repository root
@@ -77,23 +121,14 @@ def _remove_worktree(repo_root: str, worktree_path: str) -> bool:
     if not target.exists():
         return True
 
-    result = subprocess.run(
-        ["git", "worktree", "remove", str(target), "--force"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
-    if result.returncode != 0:
-        log_error(f"Failed to remove worktree at {target}: {result.stderr.strip()}")
+    try:
+        remove_worktree_path(Path(repo_root), target)
+    except RuntimeError as exc:
+        log_error(str(exc))
         return False
 
-    # Prune stale worktree references
-    subprocess.run(
-        ["git", "worktree", "prune"],
-        cwd=repo_root,
-        capture_output=True,
-        text=True,
-    )
+    for problem in _prune_worktrees(repo_root):
+        log_error(f"Worktree removed, but {problem}")
 
     return True
 
@@ -116,16 +151,30 @@ def _check_dirty(cwd: str) -> list[str]:
     return get_dirty_lines(cwd)
 
 
-def _update_plan_after_switch(plan_path: str, repo_root: str) -> None:
+def _update_plan_after_switch(
+    plan_path: str, workspace_root: Path, verification_dir: str
+) -> bool:
     """Update Plan Worktree metadata after switching.
 
     - Replace path: <original> → path: (removed)
     - Add Verification Dir metadata field after Worktree block
-    - Commit the Plan change
+    - Commit the Plan change in the Plan's own repo (space repo)
+
+    Plan files live under .wopal-space/plans/ in the space repo, not in the
+    project repo that was just switched. The owning repo is resolved from
+    the Plan path itself (same pattern as lib.plan_state.reset_plan_index);
+    committing anywhere else silently loses the metadata edit.
 
     Args:
         plan_path: Absolute path to the Plan file
-        repo_root: Git repo root where Plan lives (for commit)
+        workspace_root: Workspace root path
+        verification_dir: Directory where the user runs verification (the
+            switched project repo) — recorded as metadata, not committed there
+
+    Returns:
+        True when the metadata edit is committed in the Plan's repo; False
+        when the commit failed (the edit is on disk but uncommitted — the
+        caller exits non-zero with manual-commit guidance).
     """
     plan_file = Path(plan_path)
     content = plan_file.read_text()
@@ -146,88 +195,32 @@ def _update_plan_after_switch(plan_path: str, repo_root: str) -> None:
     wt_match = re.search(wt_pattern, content)
     if wt_match:
         end_pos = wt_match.end()
-        verification_line = f"- **Verification Dir**: {repo_root}\n"
+        verification_line = f"- **Verification Dir**: {verification_dir}\n"
         content = content[:end_pos] + verification_line + content[end_pos:]
 
     plan_file.write_text(content)
 
-    # Commit the Plan change
-    plan_file_rel = get_relative_path(str(plan_file), repo_root)
-    commit_paths(
-        repo_root,
-        [plan_file_rel],
+    # Commit the Plan change in the Plan's owning repo — a failed commit is
+    # reported, never silently swallowed.
+    location = resolve_plan_location(plan_file, workspace_root)
+    result = commit_paths(
+        str(location.repo_root),
+        [location.repo_relative_path],
         "docs(plan): verify-switch — update worktree metadata",
     )
-
-
-def _switch_ontology(
-    workspace_root: Path,
-    wt_ctx,
-    issue: str,
-    plan_path: str,
-) -> bool:
-    """Switch .wopal/ to feature branch for ontology-worktree.
-
-    Steps:
-    1. Check dirty on .wopal/ — warn, don't block
-    2. Remove worktree from main repo
-    3. git fetch in .wopal/
-    4. git checkout <feature_branch> in .wopal/
-    5. Update Plan metadata
-    6. Print verification guidance
-
-    Args:
-        issue: Issue number or plan name (for guidance output)
-        plan_path: Path to Plan file (for metadata update)
-    Returns:
-        True if switch succeeded
-    """
-    wopal_dir = workspace_root / ".wopal"
-    branch = wt_ctx.branch
-    # Merge target is the current space layer branch (space/<name>), detected
-    # at runtime before checkout — .wopal/ worktree currently sits on it.
-    merge_target = get_current_branch(str(wopal_dir))
-    wt_path = str(_resolve_wt_path(wt_ctx.path, workspace_root))
-
-    # Get repo_root from ontology main repo for guidance message
-    main_repo = get_ontology_main_repo(workspace_root)
-    repo_root = str(main_repo) if main_repo else str(wopal_dir)
-
-    # 1. Check dirty on .wopal/
-    dirty_files = _check_dirty(str(wopal_dir))
-    if dirty_files:
-        log_warn(
-            f"Canonical path has uncommitted changes "
-            f"({len(dirty_files)} files)"
+    if not result:
+        log_error("Failed to commit Plan metadata update after switch:")
+        log_error(str(result))
+        log_error(
+            f"Plan 元数据已写入磁盘但未提交（仓库: {location.repo_root}）"
         )
-
-    # 2. Remove worktree from main repo
-    main_repo = get_ontology_main_repo(workspace_root)
-    if main_repo:
-        if not _remove_worktree(str(main_repo), wt_path):
-            log_error("Failed to remove worktree for ontology-worktree switch")
-            return False
-
-    # 3. Fetch
-    if not _git_fetch(str(wopal_dir)):
+        log_error(
+            f"手动提交: git -C {location.repo_root} add "
+            f"{location.repo_relative_path} && git -C {location.repo_root} "
+            f'commit -m "docs(plan): verify-switch — update worktree metadata"'
+        )
         return False
 
-    # 4. Checkout
-    if not _git_checkout(branch, str(wopal_dir)):
-        return False
-
-    # 5. Update Plan metadata
-    _update_plan_after_switch(plan_path, str(wopal_dir))
-
-    # 6. Print verification guidance
-    log_success(f"Switched .wopal/ to '{branch}'")
-    print()
-    log_step("Verification steps:")
-    print(f"  1. Restart ellamaka to verify ontology changes")
-    print(f"  2. Verify the feature branch: '{branch}'")
-    print(f"  3. After verification, merge manually:")
-    print(f"     cd {repo_root} && git checkout {merge_target} && git pull && git merge {branch}")
-    print(f"  4. Run: flow.sh verify {issue} --confirm")
     return True
 
 
@@ -255,7 +248,6 @@ def _switch_standard(
     """
     branch = wt_ctx.branch
     wt_path = str(_resolve_wt_path(wt_ctx.path, workspace_root))
-    merge_target = "main"
 
     # Get repo_root from Plan metadata (Project Path)
     project = get_plan_field(plan_path, "Target Project")
@@ -286,17 +278,18 @@ def _switch_standard(
     if not _git_checkout(branch, repo_root):
         return False
 
-    # 5. Update Plan metadata
-    _update_plan_after_switch(plan_path, repo_root)
+    # 5. Update Plan metadata (committed in the Plan's own repo)
+    if not _update_plan_after_switch(plan_path, workspace_root, repo_root):
+        return False
 
     # 6. Print verification guidance
     log_success(f"Switched project repo to '{branch}'")
     print()
     log_step("Verification steps:")
     print(f"  1. Run tests in the project repo")
-    print(f"  2. After verification, merge manually:")
-    print(f"     cd {repo_root} && git checkout {merge_target} && git pull && git merge {branch}")
-    print(f"  3. Run: flow.sh verify {issue} --confirm")
+    print(f"  2. After verification, return to the integration branch")
+    print(f"  3. Run: flow.sh integrate {issue} --confirm")
+    print(f"  4. Run: flow.sh verify {issue} --confirm")
     return True
 
 
@@ -332,16 +325,12 @@ def run_verify_switch(issue: str) -> bool:
         return False
 
     branch = wt_ctx.branch
-    project_type = wt_ctx.project_type
 
     if not branch:
         log_error("Worktree metadata has empty branch")
         return False
 
-    if project_type == "ontology-worktree":
-        return _switch_ontology(workspace_root, wt_ctx, issue, str(plan_path))
-    else:
-        return _switch_standard(workspace_root, wt_ctx, issue, str(plan_path))
+    return _switch_standard(workspace_root, wt_ctx, issue, str(plan_path))
 
 
 if __name__ == "__main__":

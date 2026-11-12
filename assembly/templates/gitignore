@@ -1,0 +1,38 @@
+# Runtime
+.env
+.env.*
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.ruff_cache/
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Space runtime (transient)
+.wopal-space/.tmp/
+.wopal-space/logs/
+
+# Private held content (CLI-managed; never committed)
+.wopal-space/state/held/
+
+# Ontology worktree (separate git)
+.wopal/
+
+# Project containers (subprojects are independent git repos)
+/projects/
+/contents/
+/labs/

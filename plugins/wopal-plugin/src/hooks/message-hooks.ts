@@ -1,10 +1,28 @@
-import { extractSessionID, extractLatestUserPrompt, extractAgentName, type MessageWithInfo } from "./message-context.js";
+import {
+  extractSessionID,
+  extractLatestUserPrompt,
+  extractAgentName,
+  type MessageWithInfo,
+} from "./message-context.js";
 import type { SessionStore } from "../session-store.js";
 import type { LoggerInstance } from "../logger.js";
 import type { SimpleTaskManager } from "../tasks/simple-task-manager.js";
-import { injectSkillReload, type SkillReloadInjectorContext } from "./skill-reload-injector.js";
-import { injectRulesToMessage, type RuleMessageInjectorContext } from "./rule-message-injector.js";
-import { injectMemoryToMessage, type MemoryMessageInjectorContext } from "./memory-message-injector.js";
+import {
+  injectSkillReload,
+  type SkillReloadInjectorContext,
+} from "./skill-reload-injector.js";
+import {
+  injectRulesToMessage,
+  type RuleMessageInjectorContext,
+} from "./rule-message-injector.js";
+import {
+  injectMemoryToMessage,
+  type MemoryMessageInjectorContext,
+} from "./memory-message-injector.js";
+import {
+  injectSkillCatalog,
+  type SkillCatalogInjectorContext,
+} from "./skill-catalog-injector.js";
 
 /** Max recent messages to store for short-query context enrichment */
 const MAX_RECENT_MESSAGES = 10;
@@ -22,9 +40,14 @@ export interface MessageHookContext {
   ruleMessageCtx: RuleMessageInjectorContext;
   taskManager?: SimpleTaskManager | undefined;
   memoryMessageCtx: MemoryMessageInjectorContext;
+  skillCatalogCtx?: SkillCatalogInjectorContext;
 }
 
 export function createMessageHooks(ctx: MessageHookContext) {
+  // Capabilities default to enabled when not provided (backward compatibility)
+  const memoryInjectionEnabled =
+    ctx.memoryMessageCtx.capabilities?.memoryInjectionEnabled ?? true;
+
   async function onMessagesTransform(
     _input: Record<string, never>,
     output: MessagesTransformOutput,
@@ -46,7 +69,9 @@ export function createMessageHooks(ctx: MessageHookContext) {
         if (userPrompt && !state.lastUserPrompt) {
           state.lastUserPrompt = userPrompt;
         }
-        state.needsMemoryInjection = true;
+        if (memoryInjectionEnabled) {
+          state.needsMemoryInjection = true;
+        }
         state.seededFromHistory = true;
         state.seedCount = (state.seedCount ?? 0) + 1;
         state.recentMessages = recentMessages;
@@ -70,8 +95,24 @@ export function createMessageHooks(ctx: MessageHookContext) {
     }
 
     await injectSkillReload(ctx.skillReloadCtx, sessionID, lastUserMsg);
-    await injectRulesToMessage(ctx.ruleMessageCtx, sessionID, output.messages, lastUserMsg);
-    await injectMemoryToMessage(ctx.memoryMessageCtx, sessionID, output.messages, lastUserMsg);
+    await injectRulesToMessage(
+      ctx.ruleMessageCtx,
+      sessionID,
+      output.messages,
+      lastUserMsg,
+    );
+    await injectMemoryToMessage(
+      ctx.memoryMessageCtx,
+      sessionID,
+      output.messages,
+      lastUserMsg,
+    );
+
+    // Dynamic Skill catalog is append-only and runs after injectors that target
+    // the retained last user message, so it cannot perturb their target lookup.
+    if (ctx.skillCatalogCtx) {
+      await injectSkillCatalog(ctx.skillCatalogCtx, sessionID, output.messages);
+    }
 
     // Store transformed messages for auto dump
     ctx.transformedMessagesMap.set(sessionID, output.messages);
@@ -122,7 +163,9 @@ export function createMessageHooks(ctx: MessageHookContext) {
       if (userPrompt) {
         ctx.sessionStore.upsert(sessionID, (state) => {
           state.lastUserPrompt = userPrompt;
-          state.needsMemoryInjection = true;
+          if (memoryInjectionEnabled) {
+            state.needsMemoryInjection = true;
+          }
         });
       }
     }

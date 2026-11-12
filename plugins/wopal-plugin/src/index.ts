@@ -6,41 +6,73 @@
  * Task is a perpetual dialog channel - no terminal states, only running/waiting/error.
  */
 
-import type { PluginInput, Hooks } from "@opencode-ai/plugin";
-import type { SystemPromptMetadata, OpenCodeClient } from "./types.js";
-import { createOpencodeClient as createV2OpencodeClient } from "@opencode-ai/sdk/v2";
+import type {
+  PluginInput,
+  Hooks,
+  PluginOptions,
+  SystemPromptMetadata,
+} from "@wopal/ellamaka-plugin";
+import type { OpenCodeClient } from "./types.js";
+import { createOpencodeClient as createV2OpencodeClient } from "@wopal/ellamaka-sdk/v2";
 import { discoverRuleFiles, type DiscoveredRule } from "./rules/index.js";
 import { createHookContext, createAllHooks } from "./hooks/index.js";
 import { sessionStore } from "./session-store-instance.js";
-import { createPluginLoggers, type PluginLoggers } from "./logger.js";
+import {
+  bindLoggerRuntime,
+  createPluginLoggers,
+  type PluginLoggers,
+} from "./logger.js";
 import { SimpleTaskManager } from "./tasks/simple-task-manager.js";
 import { MonitorEngine } from "./monitor/monitor-engine.js";
 import { createMainSessionMonitorStrategy } from "./monitor/main-session-monitor.js";
 import { registerManagerForCleanup } from "./lifecycle/process-cleanup.js";
 import { createWopalTools } from "./tools/index.js";
-import { createRuntimeContext, type RuntimeContext } from "./runtime-context.js";
-import { loadRuntimeEnvironment, type RuntimeEnvironment } from "./runtime-environment.js";
-import { createMemoryPrompts, type MemoryPrompts } from "./memory/prompts.js";
+import { SessionSkillOverlay } from "./session-skill-overlay.js";
+import {
+  createRuntimeContext,
+  type RuntimeContext,
+} from "./runtime-context.js";
+import {
+  loadRuntimeEnvironment,
+  type RuntimeEnvironment,
+} from "./runtime-environment.js";
+import { createContextPrompts, type ContextPrompts } from "./context/index.js";
+import { MemoryInjector } from "./memory/injector.js";
+import { MemoryRetriever } from "./memory/retriever.js";
+import { DistillEngine } from "./context/index.js";
+import { loadWopalConfig, type WopalPluginConfig } from "./config/index.js";
+import {
+  resolveResources,
+  type PluginResources,
+  type ResourceRuntime,
+} from "./resources/index.js";
 
 interface MemorySystem {
-  injector: import("./memory/injector.js").MemoryInjector;
-  distillEngine: import("./memory/distill.js").DistillEngine;
-  store: import("./memory/store.js").MemoryStore;
-  embedder: import("./memory/embedder.js").EmbeddingClient;
-  llm: import("./llm-client.js").LLMClient;
-  prompts: MemoryPrompts;
+  injector: MemoryInjector;
 }
 
 export interface PluginRuntime {
   context: RuntimeContext;
   env: RuntimeEnvironment;
   loggers: PluginLoggers;
-  prompts: MemoryPrompts;
+  prompts: ContextPrompts;
+  config: WopalPluginConfig;
 }
 
 interface RuntimePluginInput {
   directory: string;
   wopalSpaceRoot?: string;
+  /**
+   * Engine-delivered slice `PluginInput.pluginConfig["wopal-plugin"]` —
+   * already merged across the three settings layers by the engine. Absent
+   * (or undefined) means the space declares no entry; defaults apply.
+   */
+  pluginConfig?: Record<string, unknown>;
+  /**
+   * Inline mount options (the plugin's second argument), the compatibility
+   * layer between the built-in defaults and the engine-delivered slice.
+   */
+  inlineOptions?: Record<string, unknown>;
 }
 
 export function createPluginRuntime(input: RuntimePluginInput): PluginRuntime {
@@ -52,77 +84,70 @@ export function createPluginRuntime(input: RuntimePluginInput): PluginRuntime {
       : {}),
   });
   const env = loadRuntimeEnvironment(context);
-  const loggers = createPluginLoggers(context, env);
-  const prompts = createMemoryPrompts(context, env, loggers.memory);
-  return Object.freeze({ context, env, loggers, prompts });
+  const config = loadWopalConfig({
+    ...(input.inlineOptions !== undefined
+      ? { inlineOptions: input.inlineOptions }
+      : {}),
+    ...(input.pluginConfig !== undefined
+      ? { pluginConfig: input.pluginConfig }
+      : {}),
+    fallbackEnvironment: env,
+  });
+  const { logLevel, logFile, logModules } = config;
+  const logConfig = {
+    ...(logLevel !== undefined ? { level: logLevel } : {}),
+    ...(logFile !== undefined ? { file: logFile } : {}),
+    ...(logModules !== undefined ? { modules: logModules } : {}),
+  };
+  const loggers = createPluginLoggers(context, env, logConfig);
+  // Module-level singletons (`contextLogger` and friends) are process-wide but
+  // the process can host several runtimes; point them at this runtime's log
+  // destination so singleton call sites land in this space's log, not the
+  // global `<WOPAL_HOME>/logs` file.
+  bindLoggerRuntime(context, env, logConfig);
+  const prompts = createContextPrompts(context, loggers.context);
+  return Object.freeze({ context, env, loggers, prompts, config });
 }
 
-/** Check required env vars for memory system. Returns list of missing var names. */
-function diagnoseMemoryEnv(environment: RuntimeEnvironment): string[] {
-  const required = [
-    "WOPAL_LLM_BASE_URL",
-    "WOPAL_LLM_API_KEY",
-    "WOPAL_EMBEDDING_BASE_URL",
-    "WOPAL_EMBEDDING_MODEL",
-  ];
-  return required.filter((variable) => !environment[variable]);
+async function createPluginResources(
+  runtime: PluginRuntime,
+): Promise<PluginResources> {
+  const resourceRuntime: ResourceRuntime = {
+    context: runtime.context,
+    env: runtime.env,
+    loggers: {
+      core: runtime.loggers.core,
+      memory: runtime.loggers.memory,
+    },
+  };
+  return resolveResources(runtime.config, resourceRuntime);
 }
 
-async function createMemorySystem(runtime: PluginRuntime): Promise<MemorySystem | null> {
-  const missing = diagnoseMemoryEnv(runtime.env);
-  if (missing.length > 0) {
-    runtime.loggers.core.warn(
-      `Memory system disabled: missing env vars (${missing.join(", ")}). ` +
-      `Set them in $WOPAL_HOME/.env or <space>/.wopal/.env. ` +
-      `Set WOPAL_MEMORY_ENABLED=false to suppress this warning.`
-    );
-    return null;
-  }
-
-  try {
-    const { MemoryStore } = await import("./memory/store.js");
-    const { EmbeddingClient } = await import("./memory/embedder.js");
-    const { LLMClient } = await import("./llm-client.js");
-    const { DistillEngine } = await import("./memory/distill.js");
-    const { MemoryRetriever } = await import("./memory/retriever.js");
-    const { MemoryInjector } = await import("./memory/injector.js");
-
-    const store = new MemoryStore(
-      undefined,
-      runtime.context.wopalHome,
-      runtime.loggers.memory,
-    );
-    await store.init();
-
-    const embedder = new EmbeddingClient(runtime.env, runtime.loggers.memory);
-    const llm = new LLMClient(runtime.env, runtime.loggers.core);
-    const distillEngine = new DistillEngine(
-      store,
-      embedder,
-      llm,
-      runtime.prompts,
-      runtime.loggers.memory,
-    );
-    const retriever = new MemoryRetriever(store, embedder, runtime.loggers.memory);
-    const injector = new MemoryInjector(retriever, runtime.loggers.memory);
-
-    runtime.loggers.memory.info(`Memory system ready (LanceDB, Embedding, LLM)`);
-    return { injector, distillEngine, store, embedder, llm, prompts: runtime.prompts };
-  } catch (error) {
-    runtime.loggers.core.warn({ err: error instanceof Error ? error : new Error(String(error)) }, "Memory system initialization failed (non-fatal)");
-    return null;
-  }
-}
-
-const openCodeRulesPlugin = async (pluginInput: PluginInput): Promise<Hooks> => {
-  const input = pluginInput as PluginInput & { wopalSpaceRoot?: string };
+const openCodeRulesPlugin = async (
+  pluginInput: PluginInput,
+  options?: PluginOptions,
+): Promise<Hooks> => {
+  // `PluginInput` from `@wopal/ellamaka-plugin` already declares the fork's
+  // `wopalSpaceRoot` and `pluginConfig` extensions, so no local cast is needed
+  // to read them.
+  const input = pluginInput;
+  // The engine delivers the whole `wopal.pluginConfig` table (contract 2.0.7);
+  // the plugin takes its own entry and keeps the inline mount options
+  // (`options`, the compatibility layer) beneath it. The optional chain
+  // tolerates an engine that predates the contract field — absent table /
+  // entry = inline options or built-in defaults.
+  const pluginConfigSlice = input.pluginConfig?.["wopal-plugin"];
   const runtime = createPluginRuntime({
     directory: input.directory,
     ...(input.wopalSpaceRoot !== undefined
       ? { wopalSpaceRoot: input.wopalSpaceRoot }
       : {}),
+    ...(pluginConfigSlice !== undefined
+      ? { pluginConfig: pluginConfigSlice }
+      : {}),
+    ...(options !== undefined ? { inlineOptions: options } : {}),
   });
-  const { context: runtimeCtx, env, loggers } = runtime;
+  const { context: runtimeCtx, loggers } = runtime;
   const {
     core: coreLogger,
     rules: rulesLogger,
@@ -130,23 +155,24 @@ const openCodeRulesPlugin = async (pluginInput: PluginInput): Promise<Hooks> => 
   } = loggers;
 
   coreLogger.debug(`Loading plugin: ${input.directory}`);
-  coreLogger.info({
-    wopal_space: runtimeCtx.isWopalSpace,
-    ...(runtimeCtx.wopalSpaceRoot ? { space_root: runtimeCtx.wopalSpaceRoot } : {}),
-    wopal_home: runtimeCtx.wopalHome,
-  }, "Runtime context initialized");
+  coreLogger.info(
+    {
+      wopal_space: runtimeCtx.isWopalSpace,
+      ...(runtimeCtx.wopalSpaceRoot
+        ? { space_root: runtimeCtx.wopalSpaceRoot }
+        : {}),
+      wopal_home: runtimeCtx.wopalHome,
+    },
+    "Runtime context initialized",
+  );
 
-  const rulesInjectionEnabled = env.WOPAL_RULES_INJECTION_ENABLED !== "false";
-  const memoryEnabled = env.WOPAL_MEMORY_ENABLED !== "false";
-  const memoryInjectionEnabled = env.WOPAL_MEMORY_INJECTION_ENABLED !== "false";
-  coreLogger.debug({
-    rules_injection: rulesInjectionEnabled,
-    memory: memoryEnabled,
-    memory_injection: memoryInjectionEnabled,
-  }, "Feature switches");
+  coreLogger.info({ config: runtime.config }, "Effective wopal config loaded");
 
-  // Rules module initialization
-  let ruleFiles: DiscoveredRule[];
+  // Rules injection is opt-in: config `pluginConfig["wopal-plugin"].rules.enabled`
+  // defaults to false, so discovery is skipped entirely unless the switch is
+  // turned on.
+  const rulesInjectionEnabled = runtime.config.rules.enabled === true;
+  let ruleFiles: DiscoveredRule[] = [];
   if (rulesInjectionEnabled) {
     ruleFiles = await discoverRuleFiles(undefined, rulesLogger, {
       wopalHome: runtimeCtx.wopalHome,
@@ -155,32 +181,112 @@ const openCodeRulesPlugin = async (pluginInput: PluginInput): Promise<Hooks> => 
         : {}),
     });
   } else {
-    coreLogger.info("Rules module disabled");
-    ruleFiles = [];
+    coreLogger.info(
+      { module: "rules", reason: "disabled_by_config" },
+      "Rules injection disabled",
+    );
   }
 
-  // Memory module initialization
-  let memory: MemorySystem | null;
-  if (memoryEnabled) {
-    memory = await createMemorySystem(runtime);
-  } else {
-    coreLogger.debug("Memory module disabled");
-    memory = null;
-  }
+  // Resource layer initialization — memory resources depend on memory.enabled,
+  // LLM resource depends on context.enabled (dependency-driven minimal set).
+  const resources = await createPluginResources(runtime);
+  // D-06: MemorySystem assembly requires only store + embedder. LLM is consumed
+  // by context capabilities (distillation, title generation, auto-recovery), so
+  // context.enabled=false no longer tears down the memory system.
+  const memory: MemorySystem | null =
+    resources.store && resources.embedder
+      ? {
+          injector: new MemoryInjector(
+            new MemoryRetriever(
+              resources.store,
+              resources.embedder,
+              loggers.memory,
+            ),
+            loggers.memory,
+          ),
+        }
+      : null;
 
-  coreLogger.debug(`Tools registered: wopal_task, wopal_task_output, wopal_task_reply, memory_manage, context_manage`);
+  // Context capability (D-04): LLM-driven context abilities (distillation,
+  // title generation, auto-recovery) are gated by context.enabled. Compaction
+  // is never gated (D-05).
+  const contextEnabled = runtime.config.context.enabled !== false;
+  const distillEngine =
+    contextEnabled && resources.store && resources.embedder && resources.llm
+      ? new DistillEngine(
+          resources.store,
+          resources.embedder,
+          resources.llm,
+          runtime.prompts,
+          loggers.context,
+        )
+      : undefined;
+
+  coreLogger.debug(
+    {
+      store: resources.store !== undefined,
+      embedder: resources.embedder !== undefined,
+      llm: resources.llm !== undefined,
+      context_enabled: contextEnabled,
+    },
+    "Resources resolved",
+  );
 
   // Extract the internal fetch from v1 client (which uses Server.Default().fetch
   // to route requests to the in-process Hono server, bypassing real HTTP).
   // We must pass it to v2 client so question.reply reaches the Question service.
-  const client = pluginInput.client as unknown as { _client?: { getConfig?: () => { fetch?: typeof globalThis.fetch } } } | undefined
-  const internalFetch = client?._client?.getConfig?.()?.fetch ?? globalThis.fetch;
+  const client = pluginInput.client as unknown as
+    | {
+        _client?: {
+          getConfig?: () => {
+            fetch?: typeof globalThis.fetch;
+            headers?: Headers | Record<string, string>;
+          };
+        };
+      }
+    | undefined;
+  const clientConfig = client?._client?.getConfig?.();
+  const internalFetch = clientConfig?.fetch ?? globalThis.fetch;
+
+  // Derive authorization headers for the v2 client.
+  // 1. Direct host delivery via `pluginInput.serverHeaders` (ellamaka engine with serverHeaders support).
+  // 2. Fallback to v1 client config headers (`Authorization` header passed during engine startup).
+  // Without this, v2 client requests on an authenticated sidecar fail with 401.
+  const rawInput = pluginInput as unknown as Record<string, unknown>;
+  const directServerHeaders =
+    rawInput.serverHeaders && typeof rawInput.serverHeaders === "object"
+      ? (rawInput.serverHeaders as Record<string, string>)
+      : undefined;
+
+  let fallbackAuthHeader: string | undefined;
+  if (!directServerHeaders && clientConfig?.headers) {
+    const rawHeaders = clientConfig.headers;
+    if (rawHeaders instanceof Headers) {
+      fallbackAuthHeader = rawHeaders.get("authorization") ?? undefined;
+    } else if (typeof rawHeaders === "object") {
+      fallbackAuthHeader =
+        (rawHeaders as Record<string, string>)["authorization"] ??
+        (rawHeaders as Record<string, string>)["Authorization"];
+    }
+  }
+
+  const effectiveHeaders: Record<string, string> | undefined =
+    directServerHeaders ??
+    (fallbackAuthHeader ? { Authorization: fallbackAuthHeader } : undefined);
 
   const v2Client = createV2OpencodeClient({
     baseUrl: pluginInput.serverUrl.toString(),
     directory: pluginInput.directory,
     fetch: internalFetch,
+    ...(effectiveHeaders ? { headers: effectiveHeaders } : {}),
   });
+
+  const skillOverlay = new SessionSkillOverlay(
+    v2Client,
+    sessionStore,
+    pluginInput.directory,
+    loggers.task,
+  );
 
   const taskManager = new SimpleTaskManager(
     pluginInput.client as unknown as OpenCodeClient,
@@ -189,6 +295,7 @@ const openCodeRulesPlugin = async (pluginInput: PluginInput): Promise<Hooks> => 
     pluginInput.serverUrl,
     sessionStore,
     loggers.task,
+    skillOverlay,
   );
 
   // Create MonitorEngine and register strategies
@@ -214,6 +321,8 @@ const openCodeRulesPlugin = async (pluginInput: PluginInput): Promise<Hooks> => 
   const systemMetadataMap = new Map<string, SystemPromptMetadata>();
   const systemInjectionsMap = new Map<string, string[]>();
 
+  // Config → capability state conversion happens here; hooks consume only
+  // the resolved state (never env or the raw config object).
   const ctx = createHookContext({
     client: input.client as OpenCodeClient,
     directory: input.directory,
@@ -228,16 +337,20 @@ const openCodeRulesPlugin = async (pluginInput: PluginInput): Promise<Hooks> => 
     contextLogger: loggers.context,
     taskManager,
     memoryInjector: memory?.injector,
+    skillOverlay,
     systemSnapshots,
     systemMetadataMap,
     systemInjectionsMap,
-    rulesInjectionEnabled,
-    memoryInjectionEnabled,
-    ...(memory
+    capabilities: {
+      memoryInjectionEnabled: runtime.config.memory.injection,
+      contextEnabled,
+      rulesInjectionEnabled,
+    },
+    ...(contextEnabled && resources.llm
       ? {
           generateSessionTitle: async (summary: string) =>
-            memory.llm.completeJson(
-              memory.prompts.loadTitlePrompt().replace("{{summary}}", summary),
+            resources.llm!.completeJson(
+              runtime.prompts.loadTitlePrompt().replace("{{summary}}", summary),
             ),
         }
       : {}),
@@ -245,7 +358,40 @@ const openCodeRulesPlugin = async (pluginInput: PluginInput): Promise<Hooks> => 
 
   const { hooks: hookHandlers, transformedMessagesMap } = createAllHooks(ctx);
 
-  const tools = createWopalTools(taskManager, memory?.store, memory?.embedder, sessionStore, memory?.distillEngine, pluginInput.client);
+  // memory_manage registration follows store availability (single source of
+  // truth). The embedder is optional: embedder-dependent capabilities degrade
+  // inside the tool rather than blocking registration. MemorySystem (injector)
+  // still requires store + embedder, which is why the two are passed directly.
+  const tools = createWopalTools(
+    taskManager,
+    resources.store,
+    resources.embedder,
+    sessionStore,
+    skillOverlay,
+  );
+
+  // memory_manage registration is resource-availability driven (single source
+  // of truth — resolveResources already consulted config.memory.enabled).
+  if (!tools.memory_manage) {
+    const reason =
+      runtime.config.memory.enabled === false
+        ? "disabled_by_config"
+        : "initialization_failed";
+    coreLogger.info(
+      {
+        tool: "memory_manage",
+        reason,
+        ...(reason === "initialization_failed"
+          ? {
+              store: resources.store !== undefined,
+              embedder: resources.embedder !== undefined,
+              llm: resources.llm !== undefined,
+            }
+          : {}),
+      },
+      "memory_manage not registered",
+    );
+  }
 
   // context_manage is session/context management — independent of memory system
   const { createContextManageTool } = await import("./tools/context-manage.js");
@@ -259,10 +405,18 @@ const openCodeRulesPlugin = async (pluginInput: PluginInput): Promise<Hooks> => 
     sessionStore,
     taskManager,
     runtimeCtx.logDir,
+    { contextEnabled },
+    distillEngine,
   );
 
-  coreLogger.debug({ log_file: loggers.logFile, log_level: loggers.logLevel }, "Logger config");
-  coreLogger.info({ tools: Object.keys(tools).join(", "), memory: !!memory }, "Plugin initialized");
+  coreLogger.debug(
+    { log_file: loggers.logFile, log_level: loggers.logLevel },
+    "Logger config",
+  );
+  coreLogger.info(
+    { tools: Object.keys(tools).join(", "), memory: !!memory },
+    "Plugin initialized",
+  );
 
   return {
     ...hookHandlers,
@@ -271,6 +425,6 @@ const openCodeRulesPlugin = async (pluginInput: PluginInput): Promise<Hooks> => 
 };
 
 export default {
-  id: "wopal-wopal-plugin",
+  id: "wopal-plugin",
   server: openCodeRulesPlugin,
 };
